@@ -12,8 +12,6 @@
 #  Auteur: VyroHost Team
 #
 
-set -e
-
 # ============================================================================
 #                              COULEURS & STYLES
 # ============================================================================
@@ -480,7 +478,29 @@ install_dependencies() {
 setup_database() {
     print_step "Configuration de la base de données..."
 
-    systemctl start mariadb
+    # Démarrer MariaDB (avec récupération automatique si échec)
+    if ! systemctl start mariadb 2>/dev/null; then
+        print_warning "MariaDB n'a pas pu démarrer, tentative de réparation..."
+        # Tenter de réparer les fichiers corrompus
+        if [ -f /var/lib/mysql/aria_log_control ]; then
+            rm -f /var/lib/mysql/aria_log_control 2>/dev/null
+        fi
+        # Tenter de réinitialiser si MariaDB est complètement cassé
+        if ! systemctl start mariadb 2>/dev/null; then
+            print_warning "Réinitialisation de MariaDB..."
+            systemctl stop mariadb 2>/dev/null
+            rm -rf /var/lib/mysql/* 2>/dev/null
+            mysql_install_db --user=mysql --datadir=/var/lib/mysql >> "$LOG_FILE" 2>&1 || mariadb-install-db --user=mysql --datadir=/var/lib/mysql >> "$LOG_FILE" 2>&1
+            if ! systemctl start mariadb 2>/dev/null; then
+                print_error "Impossible de démarrer MariaDB après réparation"
+                print_info "Essayez: apt purge mariadb-server -y && apt install mariadb-server -y"
+                return 1
+            fi
+            print_success "MariaDB réinitialisé et démarré"
+        else
+            print_success "MariaDB réparé et démarré"
+        fi
+    fi
     systemctl enable mariadb >> "$LOG_FILE" 2>&1
 
     DB_PASSWORD=$(random_password)
@@ -882,9 +902,6 @@ install_wings() {
     # ── Configuration automatique du Node via l'API ──
     print_step "Configuration automatique du Node..."
 
-    # Désactiver set -e pour toute la section API (les appels peuvent échouer)
-    set +e
-
     # Récupérer la clé API depuis le panel
     local API_KEY=""
     if [ -f "${INSTALL_DIR}/.env" ]; then
@@ -914,7 +931,6 @@ install_wings() {
     if [ -z "$API_KEY" ]; then
         print_warning "Impossible de créer la clé API automatiquement"
         print_info "Configurez le Node manuellement depuis le Panel"
-        set -e
         return
     fi
 
@@ -944,7 +960,6 @@ install_wings() {
     if [ -z "$LOCATION_ID" ]; then
         print_warning "Impossible de créer la Location"
         print_info "Configurez le Node manuellement depuis le Panel"
-        set -e
         return
     fi
     print_success "Location créée (ID: ${LOCATION_ID})"
@@ -982,7 +997,6 @@ install_wings() {
     if [ -z "$NODE_ID" ]; then
         print_warning "Impossible de créer le Node"
         print_info "Configurez le Node manuellement depuis le Panel"
-        set -e
         return
     fi
     print_success "Node créé (ID: ${NODE_ID}) — RAM: ${ALLOC_MEM}MB, Disque: ${TOTAL_DISK}MB"
@@ -1032,7 +1046,6 @@ install_wings() {
     else
         print_warning "Impossible de récupérer la config Wings automatiquement"
         print_info "Récupérez-la depuis: Panel → Admin → Nodes → Configuration"
-        set -e
         return
     fi
 
@@ -1055,8 +1068,6 @@ install_wings() {
     echo -e "  ${DIM}├─${NC} Daemon:        ${WHITE}port 8080${NC}"
     echo -e "  ${DIM}└─${NC} SFTP:          ${WHITE}port 2022${NC}"
 
-    # Réactiver set -e
-    set -e
 }
 
 # ============================================================================
@@ -1463,8 +1474,6 @@ uninstall_pterodactyl() {
 
     print_step "Désinstallation en cours..."
 
-    # Désactiver set -e pour la désinstallation (certains services peuvent ne pas exister)
-    set +e
 
     # Arrêt des services
     systemctl stop wings 2>/dev/null
@@ -1523,9 +1532,6 @@ uninstall_pterodactyl() {
     print_success "Fichier credentials supprimé"
 
     systemctl daemon-reload 2>/dev/null
-
-    # Réactiver set -e
-    set -e
 
     echo ""
     print_separator
