@@ -172,13 +172,10 @@ get_panel_scheme() {
 }
 
 # Retourne l'URL PHPMyAdmin selon le mode SSL
+# Retourne l'URL PHPMyAdmin (toujours sur port 8443, pas de sous-domaine requis)
 get_pma_url() {
-    local scheme=$(get_panel_scheme)
-    if [ "$USE_SSL" = true ]; then
-        echo "${scheme}://pma.${FQDN}"
-    else
-        echo "${scheme}://${FQDN}:8443"
-    fi
+    local ip=$(curl -s4 https://ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')
+    echo "http://${ip}:8443"
 }
 
 # Crée le service systemd Wings (réutilisé dans install_wings et install_node_only)
@@ -978,8 +975,11 @@ install_wings() {
     fi
 
     local PANEL_SCHEME=$(get_panel_scheme)
-    local API_URL="${PANEL_SCHEME}://${FQDN}/api/application"
+    # Utiliser localhost pour l'API (le panel est sur la même machine)
+    local API_URL="http://localhost/api/application"
     local SERVER_IP=$(curl -s4 https://ifconfig.me 2>/dev/null || curl -s4 https://ipinfo.io/ip 2>/dev/null || hostname -I | awk '{print $1}')
+
+    print_info "Clé API créée, configuration via API locale..."
 
     # 1. Créer la Location
     local LOCATION_RESPONSE=$(curl -sk "${API_URL}/locations" \
@@ -994,6 +994,8 @@ install_wings() {
     local LOCATION_ID=$(echo "$LOCATION_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['attributes']['id'])" 2>/dev/null)
 
     if [ -z "$LOCATION_ID" ]; then
+        # Log l'erreur pour debug
+        log "[DEBUG] Location response: $LOCATION_RESPONSE"
         # Essayer de récupérer une location existante
         LOCATION_ID=$(curl -sk "${API_URL}/locations" \
             -H "Authorization: Bearer ${API_KEY}" \
@@ -1038,6 +1040,7 @@ install_wings() {
     local NODE_ID=$(echo "$NODE_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['attributes']['id'])" 2>/dev/null)
 
     if [ -z "$NODE_ID" ]; then
+        log "[DEBUG] Node response: $NODE_RESPONSE"
         print_warning "Impossible de créer le Node"
         print_info "Configurez le Node manuellement depuis le Panel"
         return
@@ -1138,47 +1141,12 @@ install_phpmyadmin() {
     chown -R www-data:www-data "$PMA_DIR" 2>/dev/null || chown -R nginx:nginx "$PMA_DIR" 2>/dev/null || chown -R apache:apache "$PMA_DIR" 2>/dev/null
 
     # Configuration du serveur web pour PHPMyAdmin
+    # Toujours sur port 8443 — pas besoin de sous-domaine ni DNS supplémentaire
     if [ "$WEBSERVER" = "nginx" ]; then
-        if [ "$USE_SSL" = true ]; then
-            cat > /etc/nginx/sites-available/phpmyadmin.conf <<EOF
-server {
-    listen 80;
-    server_name pma.${FQDN};
-    return 301 https://\$server_name\$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name pma.${FQDN};
-
-    root ${PMA_DIR};
-    index index.php;
-
-    ssl_certificate /etc/letsencrypt/live/${FQDN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${FQDN}/privkey.pem;
-
-    location / {
-        try_files \$uri \$uri/ /index.php?\$query_string;
-    }
-
-    location ~ \.php$ {
-        fastcgi_pass unix:/run/php/php${PHP_VERSION}-fpm.sock;
-        fastcgi_index index.php;
-        include fastcgi_params;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-    }
-
-    location ~ /\.ht {
-        deny all;
-    }
-}
-EOF
-        else
-            # Mode IP sans SSL — PHPMyAdmin sur port 8443
-            cat > /etc/nginx/sites-available/phpmyadmin.conf <<EOF
+        cat > /etc/nginx/sites-available/phpmyadmin.conf <<EOF
 server {
     listen 8443;
-    server_name ${FQDN};
+    server_name _;
 
     root ${PMA_DIR};
     index index.php;
@@ -1199,39 +1167,26 @@ server {
     }
 }
 EOF
-        fi
         ln -sf /etc/nginx/sites-available/phpmyadmin.conf /etc/nginx/sites-enabled/
         systemctl restart nginx
     else
         cat > /etc/apache2/sites-available/phpmyadmin.conf <<EOF
-<VirtualHost *:80>
-    ServerName pma.${FQDN}
-    Redirect permanent / https://pma.${FQDN}/
-</VirtualHost>
-
-<VirtualHost *:443>
-    ServerName pma.${FQDN}
+Listen 8443
+<VirtualHost *:8443>
     DocumentRoot ${PMA_DIR}
 
     <Directory "${PMA_DIR}">
         Require all granted
         AllowOverride all
     </Directory>
-
-    SSLEngine on
-    SSLCertificateFile /etc/letsencrypt/live/${FQDN}/fullchain.pem
-    SSLCertificateKeyFile /etc/letsencrypt/live/${FQDN}/privkey.pem
 </VirtualHost>
 EOF
         a2ensite phpmyadmin.conf >> "$LOG_FILE" 2>&1
         systemctl restart apache2
     fi
 
-    if [ "$USE_SSL" = true ]; then
-        print_success "PHPMyAdmin installé sur https://pma.${FQDN}"
-    else
-        print_success "PHPMyAdmin installé sur http://${FQDN}:8443"
-    fi
+    local SERVER_IP=$(curl -s4 https://ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+    print_success "PHPMyAdmin installé sur http://${SERVER_IP}:8443"
 }
 
 # ============================================================================
