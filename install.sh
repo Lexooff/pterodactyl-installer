@@ -1241,64 +1241,40 @@ install_phpmyadmin() {
     mkdir -p "$PMA_DIR/tmp"
     chown -R www-data:www-data "$PMA_DIR" 2>/dev/null || chown -R nginx:nginx "$PMA_DIR" 2>/dev/null || chown -R apache:apache "$PMA_DIR" 2>/dev/null
 
-    # Ajouter PHPMyAdmin comme sous-dossier /phpmyadmin dans la config du Panel
+    # Rendre PHPMyAdmin accessible via /phpmyadmin
+    # Méthode symlink : aucune modification Nginx nécessaire
+    # Le Panel sert déjà les fichiers statiques + PHP depuis /var/www/pterodactyl/public/
+    # Un symlink dans public/ permet à Nginx de servir PHPMyAdmin naturellement
+    
+    # Supprimer l'ancien symlink ou dossier s'il existe
+    rm -rf "${INSTALL_DIR}/public/phpmyadmin" 2>/dev/null
+    # Supprimer tout ancien bloc Nginx PHPMyAdmin injecté
+    local NGINX_CONF="/etc/nginx/sites-available/pterodactyl.conf"
+    if [ -f "$NGINX_CONF" ]; then
+        sed -i '/# PHPMyAdmin/,/# End PHPMyAdmin/d' "$NGINX_CONF"
+        rm -f /etc/nginx/sites-available/phpmyadmin.conf 2>/dev/null
+        rm -f /etc/nginx/sites-enabled/phpmyadmin.conf 2>/dev/null
+    fi
+
+    # Créer le symlink
+    ln -sf "$PMA_DIR" "${INSTALL_DIR}/public/phpmyadmin"
+    
+    # Redémarrer Nginx/Apache pour appliquer les changements
     if [ "$WEBSERVER" = "nginx" ]; then
-        local NGINX_CONF="/etc/nginx/sites-available/pterodactyl.conf"
-        if [ -f "$NGINX_CONF" ]; then
-            # Supprimer tout ancien bloc PHPMyAdmin existant
-            sed -i '/# PHPMyAdmin/,/# End PHPMyAdmin/d' "$NGINX_CONF"
-
-            # Écrire le bloc PHPMyAdmin dans un fichier temporaire
-            cat > /tmp/pma_location.conf <<PMAEOF
-
-    # PHPMyAdmin
-    location ^~ /phpmyadmin {
-        alias ${PMA_DIR};
-        index index.php;
-
-        location ~ ^/phpmyadmin/(.+\\.php)\$ {
-            alias ${PMA_DIR}/\$1;
-            fastcgi_pass unix:/run/php/php${PHP_VERSION}-fpm.sock;
-            fastcgi_index index.php;
-            include fastcgi_params;
-            fastcgi_param SCRIPT_FILENAME ${PMA_DIR}/\$1;
-        }
-    }
-    # End PHPMyAdmin
-PMAEOF
-
-            # Insérer avant la dernière } du fichier (méthode fiable)
-            head -n -1 "$NGINX_CONF" > "${NGINX_CONF}.tmp"
-            cat /tmp/pma_location.conf >> "${NGINX_CONF}.tmp"
-            echo "}" >> "${NGINX_CONF}.tmp"
-            mv "${NGINX_CONF}.tmp" "$NGINX_CONF"
-            rm -f /tmp/pma_location.conf
-
-            # Supprimer l'ancienne config PMA séparée si elle existe
-            rm -f /etc/nginx/sites-available/phpmyadmin.conf 2>/dev/null
-            rm -f /etc/nginx/sites-enabled/phpmyadmin.conf 2>/dev/null
-
-            # Tester la config Nginx avant de redémarrer
-            if nginx -t >> "$LOG_FILE" 2>&1; then
-                systemctl restart nginx
-            else
-                print_warning "Erreur dans la config Nginx - vérifiez: nginx -t"
-            fi
-        fi
+        systemctl restart nginx >> "$LOG_FILE" 2>&1
     else
-        # Apache : alias /phpmyadmin
-        cat > /etc/apache2/conf-available/phpmyadmin.conf <<EOF
+        # Apache : ajouter le FollowSymLinks si nécessaire
+        if ! grep -q "phpmyadmin" /etc/apache2/conf-available/phpmyadmin.conf 2>/dev/null; then
+            cat > /etc/apache2/conf-available/phpmyadmin.conf <<EOF
 Alias /phpmyadmin ${PMA_DIR}
 <Directory ${PMA_DIR}>
     Require all granted
     AllowOverride all
 </Directory>
 EOF
-        a2enconf phpmyadmin >> "$LOG_FILE" 2>&1
-        # Supprimer l'ancienne config PMA séparée si elle existe
-        a2dissite phpmyadmin 2>/dev/null
-        rm -f /etc/apache2/sites-available/phpmyadmin.conf 2>/dev/null
-        systemctl restart apache2
+            a2enconf phpmyadmin >> "$LOG_FILE" 2>&1
+        fi
+        systemctl restart apache2 >> "$LOG_FILE" 2>&1
     fi
 
     local PANEL_SCHEME=$(get_panel_scheme)
