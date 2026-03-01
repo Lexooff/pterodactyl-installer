@@ -172,10 +172,10 @@ get_panel_scheme() {
 }
 
 # Retourne l'URL PHPMyAdmin selon le mode SSL
-# Retourne l'URL PHPMyAdmin (toujours sur port 8443, pas de sous-domaine requis)
+# Retourne l'URL PHPMyAdmin (sous-dossier /phpmyadmin du panel)
 get_pma_url() {
-    local ip=$(curl -s4 https://ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')
-    echo "http://${ip}:8443"
+    local scheme=$(get_panel_scheme)
+    echo "${scheme}://${FQDN}/phpmyadmin"
 }
 
 # Crée le service systemd Wings (réutilisé dans install_wings et install_node_only)
@@ -1130,7 +1130,7 @@ install_phpmyadmin() {
     spinner $! "Téléchargement de PHPMyAdmin..."
 
     tar -xzf /tmp/phpmyadmin.tar.gz -C "$PMA_DIR" --strip-components=1 >> "$LOG_FILE" 2>&1
-    rm /tmp/phpmyadmin.tar.gz
+    rm -f /tmp/phpmyadmin.tar.gz
 
     # Configuration
     local BLOWFISH_SECRET=$(openssl rand -base64 32)
@@ -1140,53 +1140,55 @@ install_phpmyadmin() {
     mkdir -p "$PMA_DIR/tmp"
     chown -R www-data:www-data "$PMA_DIR" 2>/dev/null || chown -R nginx:nginx "$PMA_DIR" 2>/dev/null || chown -R apache:apache "$PMA_DIR" 2>/dev/null
 
-    # Configuration du serveur web pour PHPMyAdmin
-    # Toujours sur port 8443 — pas besoin de sous-domaine ni DNS supplémentaire
+    # Ajouter PHPMyAdmin comme sous-dossier /phpmyadmin dans la config du Panel
     if [ "$WEBSERVER" = "nginx" ]; then
-        cat > /etc/nginx/sites-available/phpmyadmin.conf <<EOF
-server {
-    listen 8443;
-    server_name _;
+        # Injecter le bloc location /phpmyadmin dans la config Nginx du panel
+        # On l'insère juste avant la dernière accolade fermante }
+        local NGINX_CONF="/etc/nginx/sites-available/pterodactyl.conf"
+        if [ -f "$NGINX_CONF" ]; then
+            # Créer le bloc à insérer
+            local PMA_BLOCK="
+    # PHPMyAdmin
+    location /phpmyadmin {
+        alias ${PMA_DIR};
+        index index.php;
 
-    root ${PMA_DIR};
-    index index.php;
-
-    location / {
-        try_files \$uri \$uri/ /index.php?\$query_string;
+        location ~ ^/phpmyadmin/(.+\\.php)\$ {
+            alias ${PMA_DIR}/\$1;
+            fastcgi_pass unix:/run/php/php${PHP_VERSION}-fpm.sock;
+            fastcgi_index index.php;
+            include fastcgi_params;
+            fastcgi_param SCRIPT_FILENAME ${PMA_DIR}/\$1;
+        }
     }
-
-    location ~ \.php$ {
-        fastcgi_pass unix:/run/php/php${PHP_VERSION}-fpm.sock;
-        fastcgi_index index.php;
-        include fastcgi_params;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-    }
-
-    location ~ /\.ht {
-        deny all;
-    }
-}
-EOF
-        ln -sf /etc/nginx/sites-available/phpmyadmin.conf /etc/nginx/sites-enabled/
-        systemctl restart nginx
+"
+            # Insérer avant le dernier } du fichier
+            sed -i "\$i\\${PMA_BLOCK}" "$NGINX_CONF"
+            
+            # Supprimer l'ancienne config PMA séparée si elle existe
+            rm -f /etc/nginx/sites-available/phpmyadmin.conf 2>/dev/null
+            rm -f /etc/nginx/sites-enabled/phpmyadmin.conf 2>/dev/null
+            
+            systemctl restart nginx
+        fi
     else
-        cat > /etc/apache2/sites-available/phpmyadmin.conf <<EOF
-Listen 8443
-<VirtualHost *:8443>
-    DocumentRoot ${PMA_DIR}
-
-    <Directory "${PMA_DIR}">
-        Require all granted
-        AllowOverride all
-    </Directory>
-</VirtualHost>
+        # Apache : alias /phpmyadmin
+        cat > /etc/apache2/conf-available/phpmyadmin.conf <<EOF
+Alias /phpmyadmin ${PMA_DIR}
+<Directory ${PMA_DIR}>
+    Require all granted
+    AllowOverride all
+</Directory>
 EOF
-        a2ensite phpmyadmin.conf >> "$LOG_FILE" 2>&1
+        a2enconf phpmyadmin >> "$LOG_FILE" 2>&1
+        # Supprimer l'ancienne config PMA séparée si elle existe
+        a2dissite phpmyadmin 2>/dev/null
+        rm -f /etc/apache2/sites-available/phpmyadmin.conf 2>/dev/null
         systemctl restart apache2
     fi
 
-    local SERVER_IP=$(curl -s4 https://ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
-    print_success "PHPMyAdmin installé sur http://${SERVER_IP}:8443"
+    local PANEL_SCHEME=$(get_panel_scheme)
+    print_success "PHPMyAdmin installé sur ${PANEL_SCHEME}://${FQDN}/phpmyadmin"
 }
 
 # ============================================================================
