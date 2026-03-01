@@ -942,42 +942,71 @@ install_wings() {
     # ── Configuration automatique du Node via l'API ──
     print_step "Configuration automatique du Node..."
 
-    # Récupérer la clé API depuis le panel
+    # Créer la clé API via un script PHP autonome (utilise encrypt() de Laravel)
     local API_KEY=""
     if [ -f "${INSTALL_DIR}/.env" ]; then
-        # Créer une clé API application via tinker (en tant que www-data)
         print_info "Création de la clé API..."
-        local TINKER_OUTPUT=""
-        TINKER_OUTPUT=$(cd "$INSTALL_DIR" && sudo -u www-data php artisan tinker --execute="
-            \$key = \Illuminate\Support\Str::random(48);
-            \$token = new \Pterodactyl\Models\ApiKey();
-            \$token->identifier = \Illuminate\Support\Str::random(16);
-            \$token->token = hash('sha256', \$key);
-            \$token->key_type = 2;
-            \$token->user_id = 1;
-            \$token->memo = 'VyroHost Auto Installer';
-            \$token->r_nodes = 3;
-            \$token->r_locations = 3;
-            \$token->r_allocations = 3;
-            \$token->r_servers = 3;
-            \$token->r_users = 3;
-            \$token->r_eggs = 3;
-            \$token->r_nests = 3;
-            \$token->r_server_databases = 3;
-            \$token->r_database_hosts = 3;
-            \$token->save();
-            echo 'APIKEY:' . \$token->identifier . '.' . \$key;
-        " 2>&1)
-        
-        # Extraire la clé depuis la sortie (chercher APIKEY:xxx)
-        API_KEY=$(echo "$TINKER_OUTPUT" | grep "APIKEY:" | sed 's/.*APIKEY://' | tr -d '[:space:]')
-        
+
+        # Créer un script PHP temporaire qui bootstrap Laravel pour encrypt()
+        cat > /tmp/vyro_create_apikey.php <<'PHPEOF'
+<?php
+// Bootstrap Laravel pour accéder à encrypt(), DB, et les modèles
+$app = require __DIR__ . '/../var/www/pterodactyl/bootstrap/app.php';
+PHPEOF
+
+        # Réécrire le script avec le bon chemin (variable bash)
+        cat > /tmp/vyro_create_apikey.php <<INNEREOF
+<?php
+\$app = require '${INSTALL_DIR}/bootstrap/app.php';
+\$kernel = \$app->make(Illuminate\Contracts\Console\Kernel::class);
+\$kernel->bootstrap();
+
+use Pterodactyl\Models\ApiKey;
+use Illuminate\Support\Str;
+
+// Supprimer l'ancienne clé auto-installer
+ApiKey::where('memo', 'VyroHost Auto Installer')->delete();
+
+// Générer identifier avec préfixe ptla_ et clé brute
+\$identifier = ApiKey::generateTokenIdentifier(ApiKey::TYPE_APPLICATION);
+\$rawKey = Str::random(ApiKey::KEY_LENGTH);
+
+// Créer la clé API application avec encrypt() (obligatoire pour Pterodactyl)
+\$key = new ApiKey();
+\$key->key_type = ApiKey::TYPE_APPLICATION;
+\$key->identifier = \$identifier;
+\$key->token = encrypt(\$rawKey);
+\$key->user_id = 1;
+\$key->memo = 'VyroHost Auto Installer';
+\$key->r_nodes = 3;
+\$key->r_locations = 3;
+\$key->r_allocations = 3;
+\$key->r_servers = 3;
+\$key->r_users = 3;
+\$key->r_eggs = 3;
+\$key->r_nests = 3;
+\$key->r_server_databases = 3;
+\$key->r_database_hosts = 3;
+\$key->save();
+
+echo 'VYROKEY:' . \$identifier . \$rawKey;
+INNEREOF
+
+        local PHP_OUTPUT=""
+        PHP_OUTPUT=$(cd "${INSTALL_DIR}" && php /tmp/vyro_create_apikey.php 2>&1)
+        rm -f /tmp/vyro_create_apikey.php
+
+        # Extraire la clé depuis la sortie
+        API_KEY=$(echo "$PHP_OUTPUT" | grep "VYROKEY:" | sed 's/.*VYROKEY://' | tr -d '[:space:]')
+
         if [ -z "$API_KEY" ]; then
-            log "[DEBUG] Tinker output: $TINKER_OUTPUT"
-            print_warning "Tinker n'a pas pu créer la clé API"
-            print_info "Sortie: $(echo "$TINKER_OUTPUT" | tail -3)"
+            log "[DEBUG] PHP output: $PHP_OUTPUT"
+            print_warning "Impossible de créer la clé API"
+            print_info "Erreur: $(echo "$PHP_OUTPUT" | grep -i "error\|exception\|fatal" | head -1)"
+            print_info "Sortie complète: $(echo "$PHP_OUTPUT" | tail -3)"
         else
             print_success "Clé API créée"
+            log "[DEBUG] API Key created successfully"
         fi
     fi
 
