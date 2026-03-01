@@ -990,283 +990,17 @@ install_wings() {
     create_wings_service
     print_success "Service Wings configuré"
 
-    # ── Configuration automatique du Node via l'API ──
-    print_step "Configuration automatique du Node..."
+    # Créer le dossier de configuration Wings
+    mkdir -p /etc/pterodactyl
 
-    # Créer la clé API via un script PHP autonome (utilise encrypt() de Laravel)
-    local API_KEY=""
-    if [ -f "${INSTALL_DIR}/.env" ]; then
-        print_info "Création de la clé API..."
-
-        # Créer un script PHP temporaire qui bootstrap Laravel pour encrypt()
-        cat > /tmp/vyro_create_apikey.php <<'PHPEOF'
-<?php
-// Bootstrap Laravel pour accéder à encrypt(), DB, et les modèles
-$app = require __DIR__ . '/../var/www/pterodactyl/bootstrap/app.php';
-PHPEOF
-
-        # Réécrire le script avec le bon chemin (variable bash)
-        cat > /tmp/vyro_create_apikey.php <<INNEREOF
-<?php
-require '${INSTALL_DIR}/vendor/autoload.php';
-\$app = require '${INSTALL_DIR}/bootstrap/app.php';
-\$kernel = \$app->make(Illuminate\Contracts\Console\Kernel::class);
-\$kernel->bootstrap();
-
-use Pterodactyl\Models\ApiKey;
-use Illuminate\Support\Str;
-
-// Supprimer l'ancienne clé auto-installer
-ApiKey::where('memo', 'VyroHost Auto Installer')->delete();
-
-// Générer identifier avec préfixe ptla_ et clé brute
-\$identifier = ApiKey::generateTokenIdentifier(ApiKey::TYPE_APPLICATION);
-\$rawKey = Str::random(ApiKey::KEY_LENGTH);
-
-// Créer la clé API application avec encrypt() (obligatoire pour Pterodactyl)
-\$key = new ApiKey();
-\$key->key_type = ApiKey::TYPE_APPLICATION;
-\$key->identifier = \$identifier;
-\$key->token = encrypt(\$rawKey);
-\$key->user_id = 1;
-\$key->memo = 'VyroHost Auto Installer';
-\$key->r_nodes = 3;
-\$key->r_locations = 3;
-\$key->r_allocations = 3;
-\$key->r_servers = 3;
-\$key->r_users = 3;
-\$key->r_eggs = 3;
-\$key->r_nests = 3;
-\$key->r_server_databases = 3;
-\$key->r_database_hosts = 3;
-\$key->save();
-
-echo 'VYROKEY:' . \$identifier . \$rawKey;
-INNEREOF
-
-        local PHP_OUTPUT=""
-        PHP_OUTPUT=$(cd "${INSTALL_DIR}" && php /tmp/vyro_create_apikey.php 2>&1)
-        rm -f /tmp/vyro_create_apikey.php
-
-        # Extraire la clé depuis la sortie
-        API_KEY=$(echo "$PHP_OUTPUT" | grep "VYROKEY:" | sed 's/.*VYROKEY://' | tr -d '[:space:]')
-
-        if [ -z "$API_KEY" ]; then
-            log "[DEBUG] PHP output: $PHP_OUTPUT"
-            print_warning "Impossible de créer la clé API"
-            print_info "Erreur: $(echo "$PHP_OUTPUT" | grep -i "error\|exception\|fatal" | head -1)"
-            print_info "Sortie complète: $(echo "$PHP_OUTPUT" | tail -3)"
-        else
-            print_success "Clé API créée"
-            log "[DEBUG] API Key created successfully"
-        fi
-    fi
-
-    if [ -z "$API_KEY" ]; then
-        print_warning "Impossible de créer la clé API automatiquement"
-        print_info "Configurez le Node manuellement depuis le Panel"
-        return
-    fi
-
-    local PANEL_SCHEME=$(get_panel_scheme)
-    # Utiliser localhost pour l'API (le panel est sur la même machine)
-    local API_URL="http://localhost/api/application"
-    local SERVER_IP=$(curl -s4 https://ifconfig.me 2>/dev/null || curl -s4 https://ipinfo.io/ip 2>/dev/null || hostname -I | awk '{print $1}')
-
-    # 1. Créer la Location
-    print_info "Création de la Location..."
-    local LOCATION_RESPONSE=$(curl -sk "${API_URL}/locations" \
-        -H "Authorization: Bearer ${API_KEY}" \
-        -H "Content-Type: application/json" \
-        -H "Accept: application/json" \
-        -X POST \
-        -d '{"short": "VyroHost", "long": "Serveur VyroHost"}' 2>&1)
-
-    log "[DEBUG] Location response: $LOCATION_RESPONSE"
-    local LOCATION_ID=$(echo "$LOCATION_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['attributes']['id'])" 2>/dev/null)
-
-    if [ -z "$LOCATION_ID" ]; then
-        print_info "Tentative de récupération d'une location existante..."
-        local LIST_RESPONSE=$(curl -sk "${API_URL}/locations" \
-            -H "Authorization: Bearer ${API_KEY}" \
-            -H "Accept: application/json" 2>&1)
-        log "[DEBUG] Location list response: $LIST_RESPONSE"
-        LOCATION_ID=$(echo "$LIST_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['attributes']['id'])" 2>/dev/null)
-    fi
-
-    if [ -z "$LOCATION_ID" ]; then
-        print_warning "Impossible de créer la Location"
-        print_info "Réponse API: $(echo "$LOCATION_RESPONSE" | head -1)"
-        print_info "Configurez le Node manuellement depuis le Panel"
-        return
-    fi
-    print_success "Location créée (ID: ${LOCATION_ID})"
-
-    # 2. Créer le Node
-    local TOTAL_MEM=$(free -m | awk '/^Mem:/{print $2}')
-    local TOTAL_DISK=$(df -BM / | awk 'NR==2{gsub(/M/,"",$4); print $4}')
-    # Réserver 1Go pour le système
-    local ALLOC_MEM=$((TOTAL_MEM - 1024))
-    [ "$ALLOC_MEM" -lt 512 ] && ALLOC_MEM=$TOTAL_MEM
-
-    print_info "Création du Node..."
-    local NODE_RESPONSE=$(curl -sk "${API_URL}/nodes" \
-        -H "Authorization: Bearer ${API_KEY}" \
-        -H "Content-Type: application/json" \
-        -H "Accept: application/json" \
-        -X POST \
-        -d "{
-            \"name\": \"VyroHost-Node-01\",
-            \"description\": \"Node auto-configuré par VyroHost Installer\",
-            \"location_id\": ${LOCATION_ID},
-            \"fqdn\": \"${FQDN}\",
-            \"scheme\": \"${PANEL_SCHEME}\",
-            \"memory\": ${ALLOC_MEM},
-            \"memory_overallocate\": 0,
-            \"disk\": ${TOTAL_DISK},
-            \"disk_overallocate\": 0,
-            \"upload_size\": 100,
-            \"daemon_sftp\": 2022,
-            \"daemon_listen\": 8080,
-            \"behind_proxy\": false,
-            \"maintenance_mode\": false
-        }" 2>&1)
-
-    log "[DEBUG] Node response: $NODE_RESPONSE"
-    local NODE_ID=$(echo "$NODE_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['attributes']['id'])" 2>/dev/null)
-
-    if [ -z "$NODE_ID" ]; then
-        print_warning "Impossible de créer le Node"
-        print_info "Réponse API: $(echo "$NODE_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('errors', [{}])[0].get('detail', 'inconnu'))" 2>/dev/null || echo "$NODE_RESPONSE" | head -1)"
-        print_info "Configurez le Node manuellement depuis le Panel"
-        return
-    fi
-    print_success "Node créé (ID: ${NODE_ID}) — RAM: ${ALLOC_MEM}MB, Disque: ${TOTAL_DISK}MB"
-
-    # 3. Créer les Allocations (tous les ports jeux)
-    # Envoi par lots pour éviter les requêtes trop grandes
-    local GAME_PORTS=(
-        "25565-26000"   # Minecraft Java Edition
-        "19100-19200"   # Minecraft Bedrock Edition
-        "30000-30050"   # FiveM (lot 1)
-        "30050-30100"   # FiveM (lot 2)
-        "27000-27100"   # VALVE Source Engine (lot 1)
-        "27100-27200"   # VALVE Source Engine (lot 2)
-        "28015-28100"   # Rust
-        "34100-34200"   # Factorio
-        "9000-9100"     # TeamSpeak3 (lot 1)
-        "9100-9200"     # TeamSpeak3 (lot 2)
-        "8200-8300"     # Palworld
-        "7100-7200"     # SCP: Secret Laboratory
-        "7770-7790"     # Nova Life
-        "1194-1294"     # OpenVPN
-        "51820-51920"   # Wireguard
-        "40120-40220"   # TxAdmin
-        "40140"         # BeamMP
-    )
-
-    for RANGE in "${GAME_PORTS[@]}"; do
-        local ALLOC_PAYLOAD='{"ip": "'${SERVER_IP}'", "ports": ["'${RANGE}'"]}'
-        curl -sk "${API_URL}/nodes/${NODE_ID}/allocations" \
-            -H "Authorization: Bearer ${API_KEY}" \
-            -H "Content-Type: application/json" \
-            -H "Accept: application/json" \
-            -X POST \
-            -d "$ALLOC_PAYLOAD" >> "$LOG_FILE" 2>&1
-    done
-
-    print_success "Allocations créées (Minecraft, FiveM, Rust, VALVE, TS3, Palworld, etc.)"
-
-    # 4. Récupérer la configuration Wings et l'appliquer
-    # Extraire le daemon_token depuis la réponse de création du Node
-    local DAEMON_TOKEN=$(echo "$NODE_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['attributes']['daemon_token'])" 2>/dev/null)
-
-    if [ -n "$DAEMON_TOKEN" ]; then
-        # Utiliser wings configure pour générer le YAML correctement
-        print_info "Configuration de Wings via auto-deploy..."
-        mkdir -p /etc/pterodactyl
-        cd /etc/pterodactyl
-        wings configure \
-            --panel-url "${PANEL_SCHEME}://${FQDN}" \
-            --token "${DAEMON_TOKEN}" \
-            --node "${NODE_ID}" \
-            --allow-insecure >> "$LOG_FILE" 2>&1
-        cd - > /dev/null
-
-        if [ -f /etc/pterodactyl/config.yml ]; then
-            print_success "Configuration Wings appliquée"
-        else
-            print_warning "wings configure n'a pas créé le fichier config"
-            print_info "Récupérez la config depuis: Panel → Admin → Nodes → Configuration"
-        fi
-    else
-        # Fallback : télécharger la config JSON et convertir en YAML
-        print_info "Récupération de la configuration Wings..."
-        local CONFIG_RESPONSE=$(curl -sk "${API_URL}/nodes/${NODE_ID}/configuration" \
-            -H "Authorization: Bearer ${API_KEY}" \
-            -H "Accept: application/json" 2>/dev/null)
-
-        if [ -n "$CONFIG_RESPONSE" ] && echo "$CONFIG_RESPONSE" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
-            # Installer pyyaml si nécessaire et convertir JSON → YAML
-            pip3 install pyyaml -q 2>/dev/null || apt-get install -y python3-yaml -qq 2>/dev/null
-            echo "$CONFIG_RESPONSE" | python3 -c "
-import sys, json
-try:
-    import yaml
-    data = json.load(sys.stdin)
-    yaml.dump(data, sys.stdout, default_flow_style=False, allow_unicode=True)
-except ImportError:
-    # Fallback: simple JSON to YAML conversion
-    import json as j
-    def to_yaml(obj, indent=0):
-        s = ''
-        sp = '  ' * indent
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if isinstance(v, (dict, list)):
-                    s += f'{sp}{k}:\n' + to_yaml(v, indent+1)
-                elif isinstance(v, bool):
-                    s += f'{sp}{k}: {str(v).lower()}\n'
-                elif v is None:
-                    s += f'{sp}{k}:\n'
-                else:
-                    s += f'{sp}{k}: {v}\n'
-        elif isinstance(obj, list):
-            for item in obj:
-                if isinstance(item, (dict, list)):
-                    s += f'{sp}-\n' + to_yaml(item, indent+1)
-                else:
-                    s += f'{sp}- {j.dumps(item)}\n'
-        return s
-    data = json.load(open('/dev/stdin'))
-    print(to_yaml(data))
-" > /etc/pterodactyl/config.yml 2>/dev/null
-            print_success "Configuration Wings appliquée"
-        else
-            print_warning "Impossible de récupérer la config Wings automatiquement"
-            print_info "Récupérez-la depuis: Panel → Admin → Nodes → Configuration"
-        fi
-    fi
-
-    # 5. Démarrer Wings
-    systemctl enable --now wings >> "$LOG_FILE" 2>&1
-    sleep 3
-
-    if systemctl is-active --quiet wings; then
-        print_success "Wings démarré et fonctionnel !"
-    else
-        print_warning "Wings installé mais n'a pas pu démarrer"
-        print_info "Vérifiez: journalctl -xeu wings"
-    fi
-
+    print_info "Wings est installé. Pour terminer la configuration :"
     echo ""
-    echo -e "  ${DIM}├─${NC} IP du Node:    ${WHITE}${SERVER_IP}${NC}"
-    echo -e "  ${DIM}├─${NC} Location:      ${WHITE}VyroHost (ID: ${LOCATION_ID})${NC}"
-    echo -e "  ${DIM}├─${NC} Node:          ${WHITE}VyroHost-Node-01 (ID: ${NODE_ID})${NC}"
-    echo -e "  ${DIM}├─${NC} Ports alloués: ${WHITE}Minecraft, FiveM, Rust, VALVE, TS3, Palworld...${NC}"
-    echo -e "  ${DIM}├─${NC} Daemon:        ${WHITE}port 8080${NC}"
-    echo -e "  ${DIM}└─${NC} SFTP:          ${WHITE}port 2022${NC}"
-
+    echo -e "  ${DIM}1.${NC} Allez dans le ${WHITE}Panel → Admin → Nodes${NC}"
+    echo -e "  ${DIM}2.${NC} Créez un ${WHITE}Node${NC} (Location + Node + Allocations)"
+    echo -e "  ${DIM}3.${NC} Onglet ${WHITE}Configuration${NC} → copiez le contenu"
+    echo -e "  ${DIM}4.${NC} Collez dans ${WHITE}/etc/pterodactyl/config.yml${NC}"
+    echo -e "  ${DIM}5.${NC} Lancez: ${WHITE}systemctl restart wings${NC}"
+    echo ""
 }
 
 # ============================================================================
@@ -1333,161 +1067,6 @@ EOF
     print_success "PHPMyAdmin installé sur ${PANEL_SCHEME}://${FQDN}/phpmyadmin"
 }
 
-# ============================================================================
-#                          THÈME VYROHOST
-# ============================================================================
-
-install_vyrohost_theme() {
-    print_step "Installation du thème VyroHost..."
-
-    local THEME_DIR="${INSTALL_DIR}/resources/scripts"
-    
-    # Personnalisation du nom et des couleurs
-    if [ -f "${INSTALL_DIR}/.env" ]; then
-        sed -i "s/APP_NAME=.*/APP_NAME=\"VyroHost\"/" "${INSTALL_DIR}/.env"
-    fi
-
-    # Couleur personnalisée VyroHost (violet/purple)
-    local CSS_FILE="${INSTALL_DIR}/resources/scripts/components/App.css"
-    if [ -d "${INSTALL_DIR}/resources/scripts" ]; then
-        # Création du fichier CSS custom VyroHost
-        cat > "${INSTALL_DIR}/public/themes/vyrohost/css/custom.css" <<'CSSEOF'
-/* VyroHost Custom Theme */
-:root {
-    --vyro-primary: #7c3aed;
-    --vyro-primary-dark: #6d28d9;
-    --vyro-primary-light: #a78bfa;
-    --vyro-accent: #8b5cf6;
-    --vyro-bg-dark: #0f0a1a;
-    --vyro-bg-card: #1a1025;
-    --vyro-bg-sidebar: #150d22;
-    --vyro-text: #e2e8f0;
-    --vyro-text-muted: #94a3b8;
-    --vyro-success: #10b981;
-    --vyro-danger: #ef4444;
-    --vyro-warning: #f59e0b;
-    --vyro-border: rgba(124, 58, 237, 0.2);
-}
-
-/* Sidebar */
-.NavigationBar {
-    background: linear-gradient(180deg, var(--vyro-bg-sidebar) 0%, var(--vyro-bg-dark) 100%) !important;
-    border-right: 1px solid var(--vyro-border) !important;
-}
-
-/* Boutons primaires */
-button[class*="primary"], .Button.primary, a[class*="primary"] {
-    background: linear-gradient(135deg, var(--vyro-primary) 0%, var(--vyro-accent) 100%) !important;
-    border: none !important;
-    box-shadow: 0 4px 15px rgba(124, 58, 237, 0.3) !important;
-    transition: all 0.3s ease !important;
-}
-
-button[class*="primary"]:hover, .Button.primary:hover {
-    box-shadow: 0 6px 20px rgba(124, 58, 237, 0.5) !important;
-    transform: translateY(-1px) !important;
-}
-
-/* Cards */
-div[class*="ContentContainer"], .ContentBox {
-    background: var(--vyro-bg-card) !important;
-    border: 1px solid var(--vyro-border) !important;
-    border-radius: 12px !important;
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3) !important;
-}
-
-/* Header */
-div[class*="PageContentBlock"] > div:first-child {
-    background: linear-gradient(135deg, var(--vyro-bg-dark) 0%, #1e1133 100%) !important;
-}
-
-/* Input fields */
-input[type="text"], input[type="password"], input[type="email"], input[type="number"], textarea, select {
-    background: rgba(15, 10, 26, 0.8) !important;
-    border: 1px solid var(--vyro-border) !important;
-    color: var(--vyro-text) !important;
-    border-radius: 8px !important;
-    transition: border-color 0.3s ease !important;
-}
-
-input:focus, textarea:focus, select:focus {
-    border-color: var(--vyro-primary) !important;
-    box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.15) !important;
-}
-
-/* Status indicators */
-.status-running {
-    color: var(--vyro-success) !important;
-}
-
-/* Console */
-div[class*="terminal"] {
-    background: #0a0612 !important;
-    border-radius: 8px !important;
-}
-
-/* Scrollbar */
-::-webkit-scrollbar {
-    width: 6px;
-}
-
-::-webkit-scrollbar-track {
-    background: var(--vyro-bg-dark);
-}
-
-::-webkit-scrollbar-thumb {
-    background: var(--vyro-primary);
-    border-radius: 3px;
-}
-
-/* Footer branding */
-footer::after {
-    content: "Powered by VyroHost";
-    display: block;
-    text-align: center;
-    color: var(--vyro-text-muted);
-    font-size: 0.75rem;
-    padding: 1rem;
-}
-
-/* Animations */
-@keyframes vyro-glow {
-    0%, 100% { box-shadow: 0 0 5px rgba(124, 58, 237, 0.2); }
-    50% { box-shadow: 0 0 20px rgba(124, 58, 237, 0.4); }
-}
-
-.server-card:hover {
-    animation: vyro-glow 2s ease-in-out infinite;
-}
-CSSEOF
-        mkdir -p "${INSTALL_DIR}/public/themes/vyrohost/css"
-        print_success "CSS custom VyroHost créé"
-    fi
-
-    # Injection du thème dans le layout
-    local LAYOUT_FILE="${INSTALL_DIR}/resources/views/templates/wrapper.blade.php"
-    if [ -f "$LAYOUT_FILE" ]; then
-        # Ajouter le lien CSS custom dans le head
-        sed -i '/<\/head>/i\    <link rel="stylesheet" href="/themes/vyrohost/css/custom.css">' "$LAYOUT_FILE"
-        print_success "Thème injecté dans le layout"
-    fi
-
-    # Favicon et logo VyroHost
-    print_info "Remplacez le logo dans: ${INSTALL_DIR}/public/assets/svgs/"
-    print_info "Remplacez le favicon dans: ${INSTALL_DIR}/public/favicons/"
-
-    # Rebuild des assets si node est disponible
-    if command -v node &>/dev/null && [ -f "${INSTALL_DIR}/package.json" ]; then
-        cd "${INSTALL_DIR}"
-        (
-            yarn install >> "$LOG_FILE" 2>&1 && yarn build:production >> "$LOG_FILE" 2>&1
-        ) &
-        spinner $! "Compilation des assets..."
-        print_success "Assets compilés avec le thème VyroHost"
-    fi
-
-    print_success "Thème VyroHost installé"
-}
 
 # ============================================================================
 #                              BACKUP SYSTÈME
@@ -1975,7 +1554,6 @@ full_install() {
     setup_webserver
     install_wings
     install_phpmyadmin
-    install_vyrohost_theme
     setup_backup
     save_credentials
 
@@ -2001,12 +1579,12 @@ main_menu() {
         echo ""
         echo -e "  ${BLUE}${BOLD}  INSTALLATION${NC}"
         echo -e "  ${DIM}  ─────────────────────────────────────────${NC}"
-        echo -e "  ${WHITE}  [1]${NC}  ${GREEN}⚡${NC} Installation complète ${DIM}(Panel + Wings + PHPMyAdmin + SSL + Thème)${NC}"
+        echo -e "  ${WHITE}  [1]${NC}  ${GREEN}⚡${NC} Installation complète ${DIM}(Panel + Wings + PHPMyAdmin + SSL)${NC}"
         echo -e "  ${WHITE}  [2]${NC}  ${CYAN}🌐${NC} Installer une Node Wings ${DIM}(connexion à un Panel externe)${NC}"
         echo -e "  ${WHITE}  [3]${NC}  ${BLUE}📦${NC} Installer uniquement le Panel"
         echo -e "  ${WHITE}  [4]${NC}  ${BLUE}🗄️${NC}  Installer uniquement PHPMyAdmin"
         echo -e "  ${WHITE}  [5]${NC}  ${BLUE}🔒${NC} Configurer SSL (Let's Encrypt)"
-        echo -e "  ${WHITE}  [6]${NC}  ${BLUE}🎨${NC} Installer le thème VyroHost"
+        echo -e "  ${WHITE}  [6]${NC}  ${BLUE}🎨${NC} Renommer le Panel ${DIM}(APP_NAME)${NC}"
         echo ""
         echo -e "  ${YELLOW}${BOLD}  MAINTENANCE${NC}"
         echo -e "  ${DIM}  ─────────────────────────────────────────${NC}"
@@ -2046,7 +1624,6 @@ main_menu() {
                 fi
                 install_panel
                 setup_webserver
-                install_vyrohost_theme
                 save_credentials
                 print_summary
                 echo -ne "\n  ${DIM}Appuyez sur Entrée pour revenir au menu...${NC}"
@@ -2090,7 +1667,14 @@ main_menu() {
                 read -r
                 ;;
             6)
-                install_vyrohost_theme
+                if [ -f "${INSTALL_DIR}/.env" ]; then
+                    input_prompt "Nouveau nom du Panel" "VyroHost" "NEW_APP_NAME"
+                    sed -i "s/APP_NAME=.*/APP_NAME=\"${NEW_APP_NAME}\"/" "${INSTALL_DIR}/.env"
+                    php ${INSTALL_DIR}/artisan config:cache >> "$LOG_FILE" 2>&1
+                    print_success "Panel renommé en '${NEW_APP_NAME}'"
+                else
+                    print_error "Le Panel n'est pas installé"
+                fi
                 echo -ne "\n  ${DIM}Appuyez sur Entrée pour revenir au menu...${NC}"
                 read -r
                 ;;
