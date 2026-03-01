@@ -945,8 +945,10 @@ install_wings() {
     # Récupérer la clé API depuis le panel
     local API_KEY=""
     if [ -f "${INSTALL_DIR}/.env" ]; then
-        # Créer une clé API application via tinker
-        API_KEY=$(cd "$INSTALL_DIR" && php artisan tinker --execute="
+        # Créer une clé API application via tinker (en tant que www-data)
+        print_info "Création de la clé API..."
+        local TINKER_OUTPUT=""
+        TINKER_OUTPUT=$(cd "$INSTALL_DIR" && sudo -u www-data php artisan tinker --execute="
             \$key = \Illuminate\Support\Str::random(48);
             \$token = new \Pterodactyl\Models\ApiKey();
             \$token->identifier = \Illuminate\Support\Str::random(16);
@@ -954,18 +956,29 @@ install_wings() {
             \$token->key_type = 2;
             \$token->user_id = 1;
             \$token->memo = 'VyroHost Auto Installer';
-            \$token->r_nodes = 1;
-            \$token->r_locations = 1;
-            \$token->r_allocations = 1;
-            \$token->r_servers = 1;
-            \$token->r_users = 1;
-            \$token->r_eggs = 1;
-            \$token->r_nests = 1;
-            \$token->r_server_databases = 1;
-            \$token->r_database_hosts = 1;
+            \$token->r_nodes = 3;
+            \$token->r_locations = 3;
+            \$token->r_allocations = 3;
+            \$token->r_servers = 3;
+            \$token->r_users = 3;
+            \$token->r_eggs = 3;
+            \$token->r_nests = 3;
+            \$token->r_server_databases = 3;
+            \$token->r_database_hosts = 3;
             \$token->save();
-            echo \$token->identifier . '.' . \$key;
-        " 2>/dev/null | tail -1)
+            echo 'APIKEY:' . \$token->identifier . '.' . \$key;
+        " 2>&1)
+        
+        # Extraire la clé depuis la sortie (chercher APIKEY:xxx)
+        API_KEY=$(echo "$TINKER_OUTPUT" | grep "APIKEY:" | sed 's/.*APIKEY://' | tr -d '[:space:]')
+        
+        if [ -z "$API_KEY" ]; then
+            log "[DEBUG] Tinker output: $TINKER_OUTPUT"
+            print_warning "Tinker n'a pas pu créer la clé API"
+            print_info "Sortie: $(echo "$TINKER_OUTPUT" | tail -3)"
+        else
+            print_success "Clé API créée"
+        fi
     fi
 
     if [ -z "$API_KEY" ]; then
@@ -979,31 +992,30 @@ install_wings() {
     local API_URL="http://localhost/api/application"
     local SERVER_IP=$(curl -s4 https://ifconfig.me 2>/dev/null || curl -s4 https://ipinfo.io/ip 2>/dev/null || hostname -I | awk '{print $1}')
 
-    print_info "Clé API créée, configuration via API locale..."
-
     # 1. Créer la Location
+    print_info "Création de la Location..."
     local LOCATION_RESPONSE=$(curl -sk "${API_URL}/locations" \
         -H "Authorization: Bearer ${API_KEY}" \
         -H "Content-Type: application/json" \
         -H "Accept: application/json" \
-        -d '{
-            "short": "VyroHost",
-            "long": "Serveur VyroHost - Auto-configuré"
-        }' 2>/dev/null)
+        -X POST \
+        -d '{"short": "VyroHost", "long": "Serveur VyroHost"}' 2>&1)
 
-    local LOCATION_ID=$(echo "$LOCATION_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['attributes']['id'])" 2>/dev/null)
+    log "[DEBUG] Location response: $LOCATION_RESPONSE"
+    local LOCATION_ID=$(echo "$LOCATION_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['attributes']['id'])" 2>/dev/null)
 
     if [ -z "$LOCATION_ID" ]; then
-        # Log l'erreur pour debug
-        log "[DEBUG] Location response: $LOCATION_RESPONSE"
-        # Essayer de récupérer une location existante
-        LOCATION_ID=$(curl -sk "${API_URL}/locations" \
+        print_info "Tentative de récupération d'une location existante..."
+        local LIST_RESPONSE=$(curl -sk "${API_URL}/locations" \
             -H "Authorization: Bearer ${API_KEY}" \
-            -H "Accept: application/json" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['attributes']['id'])" 2>/dev/null)
+            -H "Accept: application/json" 2>&1)
+        log "[DEBUG] Location list response: $LIST_RESPONSE"
+        LOCATION_ID=$(echo "$LIST_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['attributes']['id'])" 2>/dev/null)
     fi
 
     if [ -z "$LOCATION_ID" ]; then
         print_warning "Impossible de créer la Location"
+        print_info "Réponse API: $(echo "$LOCATION_RESPONSE" | head -1)"
         print_info "Configurez le Node manuellement depuis le Panel"
         return
     fi
@@ -1016,10 +1028,12 @@ install_wings() {
     local ALLOC_MEM=$((TOTAL_MEM - 1024))
     [ "$ALLOC_MEM" -lt 512 ] && ALLOC_MEM=$TOTAL_MEM
 
+    print_info "Création du Node..."
     local NODE_RESPONSE=$(curl -sk "${API_URL}/nodes" \
         -H "Authorization: Bearer ${API_KEY}" \
         -H "Content-Type: application/json" \
         -H "Accept: application/json" \
+        -X POST \
         -d "{
             \"name\": \"VyroHost-Node-01\",
             \"description\": \"Node auto-configuré par VyroHost Installer\",
@@ -1035,13 +1049,14 @@ install_wings() {
             \"daemon_listen\": 8080,
             \"behind_proxy\": false,
             \"maintenance_mode\": false
-        }" 2>/dev/null)
+        }" 2>&1)
 
+    log "[DEBUG] Node response: $NODE_RESPONSE"
     local NODE_ID=$(echo "$NODE_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['attributes']['id'])" 2>/dev/null)
 
     if [ -z "$NODE_ID" ]; then
-        log "[DEBUG] Node response: $NODE_RESPONSE"
         print_warning "Impossible de créer le Node"
+        print_info "Réponse API: $(echo "$NODE_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('errors', [{}])[0].get('detail', 'inconnu'))" 2>/dev/null || echo "$NODE_RESPONSE" | head -1)"
         print_info "Configurez le Node manuellement depuis le Panel"
         return
     fi
@@ -1075,24 +1090,81 @@ install_wings() {
             -H "Authorization: Bearer ${API_KEY}" \
             -H "Content-Type: application/json" \
             -H "Accept: application/json" \
-            -d "$ALLOC_PAYLOAD" >> "$LOG_FILE" 2>/dev/null
+            -X POST \
+            -d "$ALLOC_PAYLOAD" >> "$LOG_FILE" 2>&1
     done
 
     print_success "Allocations créées (Minecraft, FiveM, Rust, VALVE, TS3, Palworld, etc.)"
 
     # 4. Récupérer la configuration Wings et l'appliquer
-    local CONFIG_RESPONSE=$(curl -sk "${API_URL}/nodes/${NODE_ID}/configuration" \
-        -H "Authorization: Bearer ${API_KEY}" \
-        -H "Accept: application/json" 2>/dev/null)
+    # Extraire le daemon_token depuis la réponse de création du Node
+    local DAEMON_TOKEN=$(echo "$NODE_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['attributes']['daemon_token'])" 2>/dev/null)
 
-    if [ -n "$CONFIG_RESPONSE" ] && echo "$CONFIG_RESPONSE" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
-        echo "$CONFIG_RESPONSE" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin), indent=2))" > /etc/pterodactyl/config.yml 2>/dev/null
-        # Convertir JSON en YAML via Wings lui-même (Wings accepte le JSON et le convertit)
-        print_success "Configuration Wings appliquée"
+    if [ -n "$DAEMON_TOKEN" ]; then
+        # Utiliser wings configure pour générer le YAML correctement
+        print_info "Configuration de Wings via auto-deploy..."
+        mkdir -p /etc/pterodactyl
+        cd /etc/pterodactyl
+        wings configure \
+            --panel-url "${PANEL_SCHEME}://${FQDN}" \
+            --token "${DAEMON_TOKEN}" \
+            --node "${NODE_ID}" \
+            --allow-insecure >> "$LOG_FILE" 2>&1
+        cd - > /dev/null
+
+        if [ -f /etc/pterodactyl/config.yml ]; then
+            print_success "Configuration Wings appliquée"
+        else
+            print_warning "wings configure n'a pas créé le fichier config"
+            print_info "Récupérez la config depuis: Panel → Admin → Nodes → Configuration"
+        fi
     else
-        print_warning "Impossible de récupérer la config Wings automatiquement"
-        print_info "Récupérez-la depuis: Panel → Admin → Nodes → Configuration"
-        return
+        # Fallback : télécharger la config JSON et convertir en YAML
+        print_info "Récupération de la configuration Wings..."
+        local CONFIG_RESPONSE=$(curl -sk "${API_URL}/nodes/${NODE_ID}/configuration" \
+            -H "Authorization: Bearer ${API_KEY}" \
+            -H "Accept: application/json" 2>/dev/null)
+
+        if [ -n "$CONFIG_RESPONSE" ] && echo "$CONFIG_RESPONSE" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
+            # Installer pyyaml si nécessaire et convertir JSON → YAML
+            pip3 install pyyaml -q 2>/dev/null || apt-get install -y python3-yaml -qq 2>/dev/null
+            echo "$CONFIG_RESPONSE" | python3 -c "
+import sys, json
+try:
+    import yaml
+    data = json.load(sys.stdin)
+    yaml.dump(data, sys.stdout, default_flow_style=False, allow_unicode=True)
+except ImportError:
+    # Fallback: simple JSON to YAML conversion
+    import json as j
+    def to_yaml(obj, indent=0):
+        s = ''
+        sp = '  ' * indent
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, (dict, list)):
+                    s += f'{sp}{k}:\n' + to_yaml(v, indent+1)
+                elif isinstance(v, bool):
+                    s += f'{sp}{k}: {str(v).lower()}\n'
+                elif v is None:
+                    s += f'{sp}{k}:\n'
+                else:
+                    s += f'{sp}{k}: {v}\n'
+        elif isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, (dict, list)):
+                    s += f'{sp}-\n' + to_yaml(item, indent+1)
+                else:
+                    s += f'{sp}- {j.dumps(item)}\n'
+        return s
+    data = json.load(open('/dev/stdin'))
+    print(to_yaml(data))
+" > /etc/pterodactyl/config.yml 2>/dev/null
+            print_success "Configuration Wings appliquée"
+        else
+            print_warning "Impossible de récupérer la config Wings automatiquement"
+            print_info "Récupérez-la depuis: Panel → Admin → Nodes → Configuration"
+        fi
     fi
 
     # 5. Démarrer Wings
