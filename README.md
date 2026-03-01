@@ -213,8 +213,8 @@ Ce fichier contient :
 ## ⚠️ Notes importantes
 
 1. **DNS** : Assurez-vous que votre domaine pointe vers le serveur AVANT l'installation
-2. **PHPMyAdmin** : Accessible via `pma.votredomaine.com` (nécessite un enregistrement DNS séparé)
-3. **Wings** : Après l'installation, configurez le Node dans le Panel puis collez la config dans `/etc/pterodactyl/config.yml`
+2. **PHPMyAdmin** : Accessible via `votredomaine.com/phpmyadmin` (aucun DNS supplémentaire nécessaire)
+3. **Wings** : Le Node et la Location sont créés automatiquement. La config Wings est appliquée automatiquement.
 4. **Sécurité** : Le fichier credentials est en chmod 600. Ne le partagez jamais.
 
 ---

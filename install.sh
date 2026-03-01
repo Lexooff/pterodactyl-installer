@@ -475,42 +475,82 @@ install_dependencies() {
 setup_database() {
     print_step "Configuration de la base de données..."
 
-    # Démarrer MariaDB (avec récupération automatique si échec)
+    # Fonction helper pour tuer TOUS les processus MySQL/MariaDB
+    kill_all_mysql() {
+        systemctl stop mariadb &>/dev/null || true
+        systemctl stop mysql &>/dev/null || true
+        # Tuer tous les processus liés à MySQL/MariaDB
+        pkill -9 -f mysqld &>/dev/null || true
+        pkill -9 -f mariadbd &>/dev/null || true
+        pkill -9 -f mysqld_safe &>/dev/null || true
+        # Attendre que tout soit mort
+        sleep 3
+        # Vérifier qu'il ne reste rien
+        while pgrep -f "mysqld|mariadbd" &>/dev/null; do
+            pkill -9 -f "mysqld|mariadbd" &>/dev/null || true
+            sleep 1
+        done
+        # Libérer le port 3306
+        fuser -k 3306/tcp &>/dev/null || true
+        # Nettoyer socket et PID
+        rm -f /var/run/mysqld/mysqld.sock &>/dev/null
+        rm -f /var/lib/mysql/*.pid &>/dev/null
+        rm -f /tmp/mysql.sock &>/dev/null
+    }
+
+    # Préparer les dossiers
+    mkdir -p /var/run/mysqld
+    chown mysql:mysql /var/run/mysqld 2>/dev/null || true
+    chmod 755 /var/run/mysqld
+
+    # Démarrer MariaDB
     if ! systemctl start mariadb &>/dev/null; then
         print_warning "MariaDB n'a pas pu démarrer, tentative de réparation..."
         
-        # Arrêter proprement tout processus MariaDB/MySQL
-        systemctl stop mariadb &>/dev/null
-        pkill -9 mysqld &>/dev/null || true
-        pkill -9 mariadbd &>/dev/null || true
-        sleep 2
-
-        # Créer le dossier run s'il n'existe pas
-        mkdir -p /var/run/mysqld
-        chown mysql:mysql /var/run/mysqld
-        chmod 755 /var/run/mysqld
+        kill_all_mysql
 
         # Nettoyer les fichiers de verrouillage et logs corrompus
         rm -f /var/lib/mysql/aria_log_control &>/dev/null
         rm -f /var/lib/mysql/ib_logfile* &>/dev/null
-        rm -f /var/lib/mysql/*.pid &>/dev/null
-        rm -f /var/run/mysqld/mysqld.sock &>/dev/null
         rm -f /var/lib/mysql/tc.log &>/dev/null
         rm -f /var/lib/mysql/multi-master.info &>/dev/null
 
+        # Recréer le dossier run
+        mkdir -p /var/run/mysqld
+        chown mysql:mysql /var/run/mysqld
+        chmod 755 /var/run/mysqld
+
         if ! systemctl start mariadb &>/dev/null; then
             print_warning "Réinitialisation complète de MariaDB..."
-            systemctl stop mariadb &>/dev/null
             
-            # Purger complètement MariaDB
+            kill_all_mysql
+            
+            # Purger TOUT (configs incluses)
             (
-                DEBIAN_FRONTEND=noninteractive apt-get purge -y mariadb-server mariadb-client mariadb-common mysql-common >> "$LOG_FILE" 2>&1
-                apt-get autoremove -y >> "$LOG_FILE" 2>&1
-                rm -rf /var/lib/mysql /etc/mysql /var/run/mysqld /var/log/mysql 2>/dev/null
+                DEBIAN_FRONTEND=noninteractive apt-get purge -y 'mariadb-*' 'mysql-*' 'galera-*' >> "$LOG_FILE" 2>&1 || true
+                apt-get autoremove -y >> "$LOG_FILE" 2>&1 || true
+                # Supprimer TOUS les dossiers (y compris configs modifiées que purge ne touche pas)
+                rm -rf /var/lib/mysql /etc/mysql /var/run/mysqld /var/log/mysql /etc/my.cnf /etc/my.cnf.d 2>/dev/null
+                # Réparer dpkg si cassé
+                dpkg --configure -a >> "$LOG_FILE" 2>&1 || true
+                apt-get -f install -y >> "$LOG_FILE" 2>&1 || true
                 # Réinstaller proprement
                 DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-server >> "$LOG_FILE" 2>&1
             ) &
             spinner $! "Réinstallation de MariaDB (cela peut prendre un moment)..."
+            
+            # Après réinstallation : vérifier que le paquet est installé
+            if ! dpkg -l mariadb-server 2>/dev/null | grep -q "^ii"; then
+                print_error "La réinstallation de MariaDB a échoué"
+                print_info "Essayez manuellement:"
+                print_info "  apt purge 'mariadb-*' 'mysql-*' -y"
+                print_info "  rm -rf /var/lib/mysql /etc/mysql /etc/my.cnf"
+                print_info "  apt install mariadb-server -y"
+                return 1
+            fi
+
+            # Tuer tout processus résiduel ENCORE (la réinstall peut en laisser)
+            kill_all_mysql
             
             # Préparer les dossiers après réinstallation
             mkdir -p /var/run/mysqld
@@ -519,22 +559,33 @@ setup_database() {
             mkdir -p /var/lib/mysql
             chown mysql:mysql /var/lib/mysql
             
-            # Initialiser la base de données si vide
+            # Initialiser la base de données si le datadir est vide
             if [ ! -f /var/lib/mysql/ibdata1 ]; then
                 print_info "Initialisation de la base de données..."
                 mariadb-install-db --user=mysql --datadir=/var/lib/mysql >> "$LOG_FILE" 2>&1 || \
                 mysql_install_db --user=mysql --datadir=/var/lib/mysql >> "$LOG_FILE" 2>&1 || true
             fi
             
+            # Dernier essai de démarrage
+            sleep 2
             if ! systemctl start mariadb &>/dev/null; then
-                # Dernier recours : démarrer manuellement pour voir l'erreur
-                print_error "Impossible de démarrer MariaDB"
-                print_info "Erreur détaillée:"
-                journalctl -xeu mariadb.service --no-pager -n 10 2>/dev/null | while read -r line; do
-                    echo -e "  ${DIM}  ${line}${NC}"
-                done
-                print_info "Essayez manuellement: apt purge mariadb-* mysql-* -y && apt install mariadb-server -y"
-                return 1
+                # Attendre un peu plus et réessayer
+                sleep 5
+                if ! systemctl start mariadb &>/dev/null; then
+                    print_error "Impossible de démarrer MariaDB"
+                    print_info "Erreur détaillée:"
+                    journalctl -xeu mariadb.service --no-pager -n 30 2>/dev/null | grep -E "Error|error|Fatal|fatal|failed|Warning|InnoDB" | head -10 | while read -r line; do
+                        echo -e "    ${DIM}${line}${NC}"
+                    done
+                    echo ""
+                    print_info "Essayez manuellement:"
+                    print_info "  systemctl stop mariadb"
+                    print_info "  apt purge 'mariadb-*' 'mysql-*' -y"
+                    print_info "  rm -rf /var/lib/mysql /etc/mysql /etc/my.cnf"
+                    print_info "  apt install mariadb-server -y"
+                    print_info "  systemctl start mariadb"
+                    return 1
+                fi
             fi
             print_success "MariaDB réinstallé et démarré"
         else
