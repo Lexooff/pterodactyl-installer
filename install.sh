@@ -59,6 +59,7 @@ INSTALL_DIR="/var/www/pterodactyl"
 BACKUP_DIR="/var/backups/pterodactyl"
 LOG_FILE="/var/log/vyrohost-installer.log"
 PHPMYADMIN_VERSION="5.2.1"
+USE_SSL=true
 
 # ============================================================================
 #                              FONCTIONS UTILITAIRES
@@ -70,7 +71,7 @@ log() {
 
 print_header() {
     clear
-    echo -e "${PURPLE}"
+    echo -e "${BLUE}${BOLD}"
     echo -e "  ██╗   ██╗██╗   ██╗██████╗  ██████╗ ██╗  ██╗ ██████╗ ███████╗████████╗"
     echo -e "  ██║   ██║╚██╗ ██╔╝██╔══██╗██╔═══██╗██║  ██║██╔═══██╗██╔════╝╚══██╔══╝"
     echo -e "  ██║   ██║ ╚████╔╝ ██████╔╝██║   ██║███████║██║   ██║███████╗   ██║   "
@@ -120,7 +121,7 @@ spinner() {
     local i=0
     while kill -0 "$pid" 2>/dev/null; do
         local char="${spinstr:$i:1}"
-        echo -ne "\r  ${PURPLE}${char}${NC} ${msg}"
+        echo -ne "\r  ${BLUE}${char}${NC} ${msg}"
         i=$(( (i + 1) % ${#spinstr} ))
         sleep 0.1
     done
@@ -167,6 +168,68 @@ random_password() {
     openssl rand -base64 32 | tr -dc 'a-zA-Z0-9!@#$%' | head -c 24
 }
 
+# Retourne "https" ou "http" selon USE_SSL
+get_panel_scheme() {
+    [ "$USE_SSL" = true ] && echo "https" || echo "http"
+}
+
+# Retourne l'URL PHPMyAdmin selon le mode SSL
+get_pma_url() {
+    local scheme=$(get_panel_scheme)
+    if [ "$USE_SSL" = true ]; then
+        echo "${scheme}://pma.${FQDN}"
+    else
+        echo "${scheme}://${FQDN}:8443"
+    fi
+}
+
+# Crée le service systemd Wings (réutilisé dans install_wings et install_node_only)
+create_wings_service() {
+    cat > /etc/systemd/system/wings.service <<EOF
+[Unit]
+Description=Pterodactyl Wings Daemon
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+User=root
+WorkingDirectory=/etc/pterodactyl
+LimitNOFILE=4096
+PIDFile=/var/run/wings/daemon.pid
+ExecStart=/usr/local/bin/wings
+Restart=on-failure
+StartLimitInterval=180
+StartLimitBurst=30
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+}
+
+# Installe Docker si nécessaire (réutilisé dans install_wings et install_node_only)
+ensure_docker() {
+    if ! command -v docker &>/dev/null; then
+        curl -sSL https://get.docker.com/ | CHANNEL=stable bash >> "$LOG_FILE" 2>&1 &
+        spinner $! "Installation de Docker..."
+        systemctl enable --now docker >> "$LOG_FILE" 2>&1
+        print_success "Docker installé"
+    else
+        print_info "Docker déjà installé"
+    fi
+}
+
+# Télécharge et installe le binaire Wings (réutilisé)
+download_wings() {
+    mkdir -p /etc/pterodactyl
+    curl -Lo /usr/local/bin/wings "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_${ARCH}" >> "$LOG_FILE" 2>&1 &
+    spinner $! "Téléchargement de Wings..."
+    chmod u+x /usr/local/bin/wings
+    print_success "Wings téléchargé"
+}
+
 progress_bar() {
     local current=$1
     local total=$2
@@ -175,7 +238,7 @@ progress_bar() {
     local filled=$((width * current / total))
     local empty=$((width - filled))
 
-    printf "\r  ${PURPLE}["
+    printf "\r  ${BLUE}["
     printf "%${filled}s" | tr ' ' '█'
     printf "%${empty}s" | tr ' ' '░'
     printf "]${NC} ${WHITE}${BOLD}%3d%%${NC}" "$percentage"
@@ -478,9 +541,11 @@ install_panel() {
     php artisan key:generate --force >> "$LOG_FILE" 2>&1
 
     # Configuration de l'environnement
+    local PANEL_SCHEME=$(get_panel_scheme)
+    
     php artisan p:environment:setup \
         --author="$EMAIL" \
-        --url="https://$FQDN" \
+        --url="${PANEL_SCHEME}://$FQDN" \
         --timezone="Europe/Paris" \
         --cache="redis" \
         --session="redis" \
@@ -555,7 +620,8 @@ EOF
 setup_nginx() {
     print_step "Configuration de Nginx..."
 
-    cat > /etc/nginx/sites-available/pterodactyl.conf <<EOF
+    if [ "$USE_SSL" = true ]; then
+        cat > /etc/nginx/sites-available/pterodactyl.conf <<EOF
 server {
     listen 80;
     server_name ${FQDN};
@@ -615,6 +681,55 @@ server {
     }
 }
 EOF
+    else
+        cat > /etc/nginx/sites-available/pterodactyl.conf <<EOF
+server {
+    listen 80;
+    server_name ${FQDN};
+
+    root ${INSTALL_DIR}/public;
+    index index.php;
+
+    access_log /var/log/nginx/pterodactyl.app-access.log;
+    error_log  /var/log/nginx/pterodactyl.app-error.log error;
+
+    client_max_body_size 100m;
+    client_body_timeout 120s;
+    sendfile off;
+
+    add_header X-Content-Type-Options nosniff;
+    add_header X-XSS-Protection "1; mode=block";
+    add_header X-Robots-Tag none;
+    add_header Content-Security-Policy "frame-ancestors 'self'";
+    add_header X-Frame-Options DENY;
+    add_header Referrer-Policy same-origin;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php$ {
+        fastcgi_split_path_info ^(.+\.php)(/.+)$;
+        fastcgi_pass unix:/run/php/php${PHP_VERSION}-fpm.sock;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param PHP_VALUE "upload_max_filesize = 100M \n post_max_size=100M";
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param HTTP_PROXY "";
+        fastcgi_intercept_errors off;
+        fastcgi_buffer_size 16k;
+        fastcgi_buffers 4 16k;
+        fastcgi_connect_timeout 300;
+        fastcgi_send_timeout 300;
+        fastcgi_read_timeout 300;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+    fi
 
     ln -sf /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-enabled/
     rm -f /etc/nginx/sites-enabled/default
@@ -711,59 +826,179 @@ setup_ssl() {
 install_wings() {
     print_step "Installation de Wings (Daemon)..."
 
-    # Docker
-    if ! command -v docker &>/dev/null; then
-        curl -sSL https://get.docker.com/ | CHANNEL=stable bash >> "$LOG_FILE" 2>&1 &
-        spinner $! "Installation de Docker..."
-        systemctl enable --now docker >> "$LOG_FILE" 2>&1
-        print_success "Docker installé"
-    else
-        print_info "Docker déjà installé"
-    fi
-
-    # Création du répertoire Wings
-    mkdir -p /etc/pterodactyl
-    
-    curl -Lo /usr/local/bin/wings "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_${ARCH}" >> "$LOG_FILE" 2>&1 &
-    spinner $! "Téléchargement de Wings..."
-    
-    chmod u+x /usr/local/bin/wings
-    print_success "Wings téléchargé"
-
-    # Service systemd
-    cat > /etc/systemd/system/wings.service <<EOF
-[Unit]
-Description=Pterodactyl Wings Daemon
-After=docker.service
-Requires=docker.service
-PartOf=docker.service
-
-[Service]
-User=root
-WorkingDirectory=/etc/pterodactyl
-LimitNOFILE=4096
-PIDFile=/var/run/wings/daemon.pid
-ExecStart=/usr/local/bin/wings
-Restart=on-failure
-StartLimitInterval=180
-StartLimitBurst=30
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
+    ensure_docker
+    download_wings
+    create_wings_service
     print_success "Service Wings configuré"
 
+    # ── Configuration automatique du Node via l'API ──
+    print_step "Configuration automatique du Node..."
+
+    # Récupérer la clé API depuis le panel
+    local API_KEY=""
+    if [ -f "${INSTALL_DIR}/.env" ]; then
+        # Créer une clé API application via tinker
+        API_KEY=$(cd "$INSTALL_DIR" && php artisan tinker --execute="
+            \$key = \Illuminate\Support\Str::random(48);
+            \$token = new \Pterodactyl\Models\ApiKey();
+            \$token->identifier = \Illuminate\Support\Str::random(16);
+            \$token->token = hash('sha256', \$key);
+            \$token->key_type = 2;
+            \$token->user_id = 1;
+            \$token->memo = 'VyroHost Auto Installer';
+            \$token->r_nodes = 1;
+            \$token->r_locations = 1;
+            \$token->r_allocations = 1;
+            \$token->r_servers = 1;
+            \$token->r_users = 1;
+            \$token->r_eggs = 1;
+            \$token->r_nests = 1;
+            \$token->r_server_databases = 1;
+            \$token->r_database_hosts = 1;
+            \$token->save();
+            echo \$token->identifier . '.' . \$key;
+        " 2>/dev/null | tail -1)
+    fi
+
+    if [ -z "$API_KEY" ]; then
+        print_warning "Impossible de créer la clé API automatiquement"
+        print_info "Configurez le Node manuellement depuis le Panel"
+        return
+    fi
+
+    local PANEL_SCHEME=$(get_panel_scheme)
+    local API_URL="${PANEL_SCHEME}://${FQDN}/api/application"
+    local SERVER_IP=$(curl -s4 https://ifconfig.me 2>/dev/null || curl -s4 https://ipinfo.io/ip 2>/dev/null || hostname -I | awk '{print $1}')
+
+    # 1. Créer la Location
+    local LOCATION_RESPONSE=$(curl -sk "${API_URL}/locations" \
+        -H "Authorization: Bearer ${API_KEY}" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -d '{
+            "short": "VyroHost",
+            "long": "Serveur VyroHost - Auto-configuré"
+        }' 2>/dev/null)
+
+    local LOCATION_ID=$(echo "$LOCATION_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['attributes']['id'])" 2>/dev/null)
+
+    if [ -z "$LOCATION_ID" ]; then
+        # Essayer de récupérer une location existante
+        LOCATION_ID=$(curl -sk "${API_URL}/locations" \
+            -H "Authorization: Bearer ${API_KEY}" \
+            -H "Accept: application/json" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['attributes']['id'])" 2>/dev/null)
+    fi
+
+    if [ -z "$LOCATION_ID" ]; then
+        print_warning "Impossible de créer la Location"
+        print_info "Configurez le Node manuellement depuis le Panel"
+        return
+    fi
+    print_success "Location créée (ID: ${LOCATION_ID})"
+
+    # 2. Créer le Node
+    local TOTAL_MEM=$(free -m | awk '/^Mem:/{print $2}')
+    local TOTAL_DISK=$(df -BM / | awk 'NR==2{gsub(/M/,"",$4); print $4}')
+    # Réserver 1Go pour le système
+    local ALLOC_MEM=$((TOTAL_MEM - 1024))
+    [ "$ALLOC_MEM" -lt 512 ] && ALLOC_MEM=$TOTAL_MEM
+
+    local NODE_RESPONSE=$(curl -sk "${API_URL}/nodes" \
+        -H "Authorization: Bearer ${API_KEY}" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -d "{
+            \"name\": \"VyroHost-Node-01\",
+            \"description\": \"Node auto-configuré par VyroHost Installer\",
+            \"location_id\": ${LOCATION_ID},
+            \"fqdn\": \"${FQDN}\",
+            \"scheme\": \"${PANEL_SCHEME}\",
+            \"memory\": ${ALLOC_MEM},
+            \"memory_overallocate\": 0,
+            \"disk\": ${TOTAL_DISK},
+            \"disk_overallocate\": 0,
+            \"upload_size\": 100,
+            \"daemon_sftp\": 2022,
+            \"daemon_listen\": 8080,
+            \"behind_proxy\": false,
+            \"maintenance_mode\": false
+        }" 2>/dev/null)
+
+    local NODE_ID=$(echo "$NODE_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['attributes']['id'])" 2>/dev/null)
+
+    if [ -z "$NODE_ID" ]; then
+        print_warning "Impossible de créer le Node"
+        print_info "Configurez le Node manuellement depuis le Panel"
+        return
+    fi
+    print_success "Node créé (ID: ${NODE_ID}) — RAM: ${ALLOC_MEM}MB, Disque: ${TOTAL_DISK}MB"
+
+    # 3. Créer les Allocations (tous les ports jeux)
+    # Envoi par lots pour éviter les requêtes trop grandes
+    local GAME_PORTS=(
+        "25565-26000"   # Minecraft Java Edition
+        "19100-19200"   # Minecraft Bedrock Edition
+        "30000-30050"   # FiveM (lot 1)
+        "30050-30100"   # FiveM (lot 2)
+        "27000-27100"   # VALVE Source Engine (lot 1)
+        "27100-27200"   # VALVE Source Engine (lot 2)
+        "28015-28100"   # Rust
+        "34100-34200"   # Factorio
+        "9000-9100"     # TeamSpeak3 (lot 1)
+        "9100-9200"     # TeamSpeak3 (lot 2)
+        "8200-8300"     # Palworld
+        "7100-7200"     # SCP: Secret Laboratory
+        "7770-7790"     # Nova Life
+        "1194-1294"     # OpenVPN
+        "51820-51920"   # Wireguard
+        "40120-40220"   # TxAdmin
+        "40140"         # BeamMP
+    )
+
+    for RANGE in "${GAME_PORTS[@]}"; do
+        local ALLOC_PAYLOAD='{"ip": "'${SERVER_IP}'", "ports": ["'${RANGE}'"]}'
+        curl -sk "${API_URL}/nodes/${NODE_ID}/allocations" \
+            -H "Authorization: Bearer ${API_KEY}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -d "$ALLOC_PAYLOAD" >> "$LOG_FILE" 2>/dev/null
+    done
+
+    print_success "Allocations créées (Minecraft, FiveM, Rust, VALVE, TS3, Palworld, etc.)"
+
+    # 4. Récupérer la configuration Wings et l'appliquer
+    local CONFIG_RESPONSE=$(curl -sk "${API_URL}/nodes/${NODE_ID}/configuration" \
+        -H "Authorization: Bearer ${API_KEY}" \
+        -H "Accept: application/json" 2>/dev/null)
+
+    if [ -n "$CONFIG_RESPONSE" ] && echo "$CONFIG_RESPONSE" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
+        echo "$CONFIG_RESPONSE" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin), indent=2))" > /etc/pterodactyl/config.yml 2>/dev/null
+        # Convertir JSON en YAML via Wings lui-même (Wings accepte le JSON et le convertit)
+        print_success "Configuration Wings appliquée"
+    else
+        print_warning "Impossible de récupérer la config Wings automatiquement"
+        print_info "Récupérez-la depuis: Panel → Admin → Nodes → Configuration"
+        return
+    fi
+
+    # 5. Démarrer Wings
+    systemctl enable --now wings >> "$LOG_FILE" 2>&1
+    sleep 3
+
+    if systemctl is-active --quiet wings; then
+        print_success "Wings démarré et fonctionnel !"
+    else
+        print_warning "Wings installé mais n'a pas pu démarrer"
+        print_info "Vérifiez: journalctl -xeu wings"
+    fi
+
     echo ""
-    print_warning "Wings est installé mais pas encore configuré !"
-    print_info "Pour terminer la configuration de Wings :"
-    echo -e "  ${DIM}  1. Allez sur le Panel → Admin → Nodes${NC}"
-    echo -e "  ${DIM}  2. Créez un nouveau Node${NC}"
-    echo -e "  ${DIM}  3. Copiez le fichier de configuration${NC}"
-    echo -e "  ${DIM}  4. Collez-le dans /etc/pterodactyl/config.yml${NC}"
-    echo -e "  ${DIM}  5. Démarrez Wings: systemctl enable --now wings${NC}"
+    echo -e "  ${DIM}├─${NC} IP du Node:    ${WHITE}${SERVER_IP}${NC}"
+    echo -e "  ${DIM}├─${NC} Location:      ${WHITE}VyroHost (ID: ${LOCATION_ID})${NC}"
+    echo -e "  ${DIM}├─${NC} Node:          ${WHITE}VyroHost-Node-01 (ID: ${NODE_ID})${NC}"
+    echo -e "  ${DIM}├─${NC} Ports alloués: ${WHITE}Minecraft, FiveM, Rust, VALVE, TS3, Palworld...${NC}"
+    echo -e "  ${DIM}├─${NC} Daemon:        ${WHITE}port 8080${NC}"
+    echo -e "  ${DIM}└─${NC} SFTP:          ${WHITE}port 2022${NC}"
 }
 
 # ============================================================================
@@ -792,7 +1027,8 @@ install_phpmyadmin() {
 
     # Configuration du serveur web pour PHPMyAdmin
     if [ "$WEBSERVER" = "nginx" ]; then
-        cat > /etc/nginx/sites-available/phpmyadmin.conf <<EOF
+        if [ "$USE_SSL" = true ]; then
+            cat > /etc/nginx/sites-available/phpmyadmin.conf <<EOF
 server {
     listen 80;
     server_name pma.${FQDN};
@@ -825,6 +1061,33 @@ server {
     }
 }
 EOF
+        else
+            # Mode IP sans SSL — PHPMyAdmin sur port 8443
+            cat > /etc/nginx/sites-available/phpmyadmin.conf <<EOF
+server {
+    listen 8443;
+    server_name ${FQDN};
+
+    root ${PMA_DIR};
+    index index.php;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php$ {
+        fastcgi_pass unix:/run/php/php${PHP_VERSION}-fpm.sock;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+        fi
         ln -sf /etc/nginx/sites-available/phpmyadmin.conf /etc/nginx/sites-enabled/
         systemctl restart nginx
     else
@@ -852,7 +1115,11 @@ EOF
         systemctl restart apache2
     fi
 
-    print_success "PHPMyAdmin installé sur https://pma.${FQDN}"
+    if [ "$USE_SSL" = true ]; then
+        print_success "PHPMyAdmin installé sur https://pma.${FQDN}"
+    else
+        print_success "PHPMyAdmin installé sur http://${FQDN}:8443"
+    fi
 }
 
 # ============================================================================
@@ -1217,31 +1484,34 @@ uninstall_pterodactyl() {
 save_credentials() {
     print_step "Sauvegarde des identifiants..."
 
+    local PANEL_SCHEME=$(get_panel_scheme)
+    local PMA_URL=$(get_pma_url)
+
     cat > /root/.vyrohost-credentials <<EOF
 ╔══════════════════════════════════════════════════════════════════╗
 ║                    VyroHost - Credentials                       ║
 ║                 Généré le $(date '+%Y-%m-%d %H:%M:%S')                   ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║                                                                  ║
-║  Panel URL:         https://${FQDN}                              
-║  PHPMyAdmin URL:    https://pma.${FQDN}                         
+║  Panel URL:         ${PANEL_SCHEME}://${FQDN}
+║  PHPMyAdmin URL:    ${PMA_URL}
 ║                                                                  ║
 ║  ─── Admin Panel ───                                             ║
-║  Email:             ${ADMIN_EMAIL}                               
-║  Username:          ${ADMIN_USERNAME}                            
-║  Password:          ${ADMIN_PASSWORD}                            
+║  Email:             ${ADMIN_EMAIL}
+║  Username:          ${ADMIN_USERNAME}
+║  Password:          ${ADMIN_PASSWORD}
 ║                                                                  ║
 ║  ─── Base de données ───                                         ║
-║  MySQL Root Pass:   ${MYSQL_ROOT_PASSWORD}                       
+║  MySQL Root Pass:   ${MYSQL_ROOT_PASSWORD}
 ║  DB Name:           panel                                        ║
 ║  DB User:           pterodactyl                                  ║
-║  DB Password:       ${DB_PASSWORD}                               
+║  DB Password:       ${DB_PASSWORD}
 ║                                                                  ║
 ║  ─── Fichiers importants ───                                     ║
-║  Panel:             ${INSTALL_DIR}                               
+║  Panel:             ${INSTALL_DIR}
 ║  Wings Config:      /etc/pterodactyl/config.yml                  ║
-║  Backups:           ${BACKUP_DIR}                                
-║  Logs:              ${LOG_FILE}                                  
+║  Backups:           ${BACKUP_DIR}
+║  Logs:              ${LOG_FILE}
 ║                                                                  ║
 ╚══════════════════════════════════════════════════════════════════╝
 EOF
@@ -1255,6 +1525,9 @@ EOF
 # ============================================================================
 
 print_summary() {
+    local PANEL_SCHEME=$(get_panel_scheme)
+    local PMA_URL=$(get_pma_url)
+
     echo ""
     print_separator
     echo ""
@@ -1262,14 +1535,24 @@ print_summary() {
     echo ""
     print_separator
     echo ""
+    echo -e "  ${RED}${BOLD}⚠  SAUVEGARDEZ CES INFORMATIONS MAINTENANT !  ⚠${NC}"
+    echo ""
+    print_separator
+    echo ""
     echo -e "  ${WHITE}${BOLD}Accès au Panel:${NC}"
-    echo -e "  ${DIM}├─${NC} URL:      ${CYAN}https://${FQDN}${NC}"
+    echo -e "  ${DIM}├─${NC} URL:      ${CYAN}${PANEL_SCHEME}://${FQDN}${NC}"
     echo -e "  ${DIM}├─${NC} Email:    ${WHITE}${ADMIN_EMAIL}${NC}"
     echo -e "  ${DIM}├─${NC} Username: ${WHITE}${ADMIN_USERNAME}${NC}"
     echo -e "  ${DIM}└─${NC} Password: ${WHITE}${ADMIN_PASSWORD}${NC}"
     echo ""
     echo -e "  ${WHITE}${BOLD}PHPMyAdmin:${NC}"
-    echo -e "  ${DIM}└─${NC} URL:      ${CYAN}https://pma.${FQDN}${NC}"
+    echo -e "  ${DIM}└─${NC} URL:      ${CYAN}${PMA_URL}${NC}"
+    echo ""
+    echo -e "  ${WHITE}${BOLD}Base de données:${NC}"
+    echo -e "  ${DIM}├─${NC} MySQL Root: ${WHITE}${MYSQL_ROOT_PASSWORD}${NC}"
+    echo -e "  ${DIM}├─${NC} DB Name:    ${WHITE}panel${NC}"
+    echo -e "  ${DIM}├─${NC} DB User:    ${WHITE}pterodactyl${NC}"
+    echo -e "  ${DIM}└─${NC} DB Pass:    ${WHITE}${DB_PASSWORD}${NC}"
     echo ""
     echo -e "  ${WHITE}${BOLD}Commandes utiles:${NC}"
     echo -e "  ${DIM}├─${NC} ${YELLOW}systemctl status pteroq${NC}     — Status du Queue Worker"
@@ -1278,15 +1561,8 @@ print_summary() {
     echo -e "  ${DIM}├─${NC} ${YELLOW}cat /root/.vyrohost-credentials${NC} — Voir les identifiants"
     echo -e "  ${DIM}└─${NC} ${YELLOW}bash install.sh${NC}             — Relancer le menu"
     echo ""
-    echo -e "  ${WHITE}${BOLD}Prochaine étape:${NC}"
-    echo -e "  ${DIM}├─${NC} 1. Connectez-vous au Panel"
-    echo -e "  ${DIM}├─${NC} 2. Allez dans Admin → Locations → Créer"
-    echo -e "  ${DIM}├─${NC} 3. Allez dans Admin → Nodes → Créer"
-    echo -e "  ${DIM}├─${NC} 4. Configurez Wings avec le token du Node"
-    echo -e "  ${DIM}└─${NC} 5. Démarrez Wings: ${YELLOW}systemctl enable --now wings${NC}"
-    echo ""
     print_separator
-    echo -e "\n  ${DIM}Merci d'utiliser VyroHost ! 💜${NC}\n"
+    echo -e "\n  ${DIM}Merci d'utiliser VyroHost ! 💙${NC}\n"
 }
 
 # ============================================================================
@@ -1322,7 +1598,23 @@ collect_info() {
     echo ""
     echo -e "  ${WHITE}${BOLD}Configuration réseau${NC}"
     echo ""
-    input_prompt "Nom de domaine (FQDN)" "" "FQDN"
+    local SERVER_IP=$(curl -s4 https://ifconfig.me 2>/dev/null || curl -s4 https://ipinfo.io/ip 2>/dev/null || hostname -I | awk '{print $1}')
+    echo -e "  ${INFO} ${BLUE}IP détectée: ${WHITE}${SERVER_IP}${NC}"
+    echo -e "  ${DIM}  Entrez votre nom de domaine (ex: exemple.com) ou l'IP du VPS${NC}"
+    echo -e "  ${DIM}  Si vous n'avez pas de domaine, vous pouvez:${NC}"
+    echo -e "  ${DIM}    • Utiliser l'IP de votre VPS: ${WHITE}${SERVER_IP}${NC}"
+    echo -e "  ${DIM}    • Demander un sous-domaine gratuit à VyroHost${NC}"
+    echo ""
+    input_prompt "Domaine ou IP" "${SERVER_IP}" "FQDN"
+    
+    # Détecter si c'est une IP (pas de SSL possible avec une IP seule)
+    USE_SSL=true
+    if [[ "$FQDN" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        USE_SSL=false
+        print_warning "Vous utilisez une IP — SSL Let's Encrypt ne sera pas configuré"
+        print_info "Utilisez http://${FQDN} pour accéder au panel"
+    fi
+    
     input_prompt "Email (pour SSL & Panel)" "" "EMAIL"
     echo ""
 
@@ -1358,6 +1650,99 @@ collect_info() {
 }
 
 # ============================================================================
+#                     INSTALLATION NODE SEULE (WINGS)
+# ============================================================================
+
+install_node_only() {
+    print_header
+    echo -e "  ${WHITE}${BOLD}Installation d'une Node Wings (connexion à un Panel externe)${NC}"
+    echo ""
+    print_separator
+    echo ""
+
+    local SERVER_IP=$(curl -s4 https://ifconfig.me 2>/dev/null || curl -s4 https://ipinfo.io/ip 2>/dev/null || hostname -I | awk '{print $1}')
+    echo -e "  ${INFO} ${BLUE}IP de ce serveur: ${WHITE}${SERVER_IP}${NC}"
+    echo ""
+
+    input_prompt "URL du Panel Pterodactyl (ex: https://panel.exemple.com)" "" "PANEL_URL"
+    echo ""
+    echo -e "  ${DIM}  Pour obtenir le token, allez sur votre Panel :${NC}"
+    echo -e "  ${DIM}  Admin → Nodes → Créer un Node → Configuration tab${NC}"
+    echo -e "  ${DIM}  Copiez tout le contenu du bloc 'Auto-Deploy'${NC}"
+    echo ""
+    input_prompt "Token Wings (depuis le Panel)" "" "WINGS_TOKEN"
+    echo ""
+
+    if ! confirm "Installer Wings avec ces paramètres ?" "o"; then
+        print_info "Installation annulée"
+        return
+    fi
+
+    print_header
+    echo -e "  ${WHITE}${BOLD}Installation de la Node Wings...${NC}"
+    echo ""
+
+    local start_time=$(date +%s)
+
+    detect_os
+
+    # Docker
+    ensure_docker
+    download_wings
+    create_wings_service
+    print_success "Service Wings configuré"
+
+    # Configurer Wings avec le token
+    cd /etc/pterodactyl
+    wings configure \
+        --panel-url "${PANEL_URL}" \
+        --token "${WINGS_TOKEN}" \
+        --node 1 >> "$LOG_FILE" 2>&1 && print_success "Wings configuré avec le Panel" || {
+        print_warning "Configuration automatique échouée"
+        print_info "Copiez manuellement la config YAML dans /etc/pterodactyl/config.yml"
+    }
+
+    # Démarrer Wings
+    systemctl enable --now wings >> "$LOG_FILE" 2>&1
+    sleep 3
+
+    local end_time=$(date +%s)
+    local duration=$(( end_time - start_time ))
+    local minutes=$(( duration / 60 ))
+    local seconds=$(( duration % 60 ))
+
+    echo ""
+    print_separator
+    echo ""
+
+    if systemctl is-active --quiet wings; then
+        echo -e "  ${STAR} ${GREEN}${BOLD}NODE WINGS INSTALLÉE ET FONCTIONNELLE !${NC} ${STAR}"
+    else
+        echo -e "  ${STAR} ${YELLOW}${BOLD}NODE WINGS INSTALLÉE (vérifiez la config)${NC} ${STAR}"
+    fi
+
+    echo ""
+    print_separator
+    echo ""
+    echo -e "  ${WHITE}${BOLD}Informations de la Node:${NC}"
+    echo -e "  ${DIM}├─${NC} IP:          ${WHITE}${SERVER_IP}${NC}"
+    echo -e "  ${DIM}├─${NC} Panel:       ${WHITE}${PANEL_URL}${NC}"
+    echo -e "  ${DIM}├─${NC} Daemon:      ${WHITE}port 8080${NC}"
+    echo -e "  ${DIM}├─${NC} SFTP:        ${WHITE}port 2022${NC}"
+    echo -e "  ${DIM}└─${NC} Config:      ${WHITE}/etc/pterodactyl/config.yml${NC}"
+    echo ""
+    echo -e "  ${DIM}Temps d'installation: ${WHITE}${minutes}m ${seconds}s${NC}"
+    echo ""
+    echo -e "  ${WHITE}${BOLD}Commandes utiles:${NC}"
+    echo -e "  ${DIM}├─${NC} ${YELLOW}systemctl status wings${NC}    — Status de Wings"
+    echo -e "  ${DIM}├─${NC} ${YELLOW}systemctl restart wings${NC}   — Redémarrer Wings"
+    echo -e "  ${DIM}└─${NC} ${YELLOW}journalctl -xeu wings${NC}    — Logs de Wings"
+    echo ""
+    print_separator
+    echo -e "\n  ${DIM}Merci d'utiliser VyroHost ! 💙${NC}\n"
+}
+
+# ============================================================================
 #                          INSTALLATION COMPLÈTE
 # ============================================================================
 
@@ -1375,9 +1760,14 @@ full_install() {
     check_resources
     install_dependencies
     setup_database
-    setup_ssl
+    if [ "$USE_SSL" = true ]; then
+        setup_ssl
+    else
+        print_info "SSL ignoré (utilisation d'une IP)"
+    fi
     install_panel
     setup_webserver
+    install_wings
     install_phpmyadmin
     install_vyrohost_theme
     setup_backup
@@ -1403,14 +1793,14 @@ main_menu() {
 
         echo -e "  ${WHITE}${BOLD}Que souhaitez-vous faire ?${NC}"
         echo ""
-        echo -e "  ${PURPLE}${BOLD}  INSTALLATION${NC}"
+        echo -e "  ${BLUE}${BOLD}  INSTALLATION${NC}"
         echo -e "  ${DIM}  ─────────────────────────────────────────${NC}"
         echo -e "  ${WHITE}  [1]${NC}  ${GREEN}⚡${NC} Installation complète ${DIM}(Panel + Wings + PHPMyAdmin + SSL + Thème)${NC}"
-        echo -e "  ${WHITE}  [2]${NC}  ${BLUE}📦${NC} Installer uniquement le Panel"
-        echo -e "  ${WHITE}  [3]${NC}  ${BLUE}🔧${NC} Installer uniquement Wings"
+        echo -e "  ${WHITE}  [2]${NC}  ${CYAN}🌐${NC} Installer une Node Wings ${DIM}(connexion à un Panel externe)${NC}"
+        echo -e "  ${WHITE}  [3]${NC}  ${BLUE}📦${NC} Installer uniquement le Panel"
         echo -e "  ${WHITE}  [4]${NC}  ${BLUE}🗄️${NC}  Installer uniquement PHPMyAdmin"
         echo -e "  ${WHITE}  [5]${NC}  ${BLUE}🔒${NC} Configurer SSL (Let's Encrypt)"
-        echo -e "  ${WHITE}  [6]${NC}  ${PURPLE}🎨${NC} Installer le thème VyroHost"
+        echo -e "  ${WHITE}  [6]${NC}  ${BLUE}🎨${NC} Installer le thème VyroHost"
         echo ""
         echo -e "  ${YELLOW}${BOLD}  MAINTENANCE${NC}"
         echo -e "  ${DIM}  ─────────────────────────────────────────${NC}"
@@ -1434,13 +1824,20 @@ main_menu() {
                 read -r
                 ;;
             2)
+                install_node_only
+                echo -ne "\n  ${DIM}Appuyez sur Entrée pour revenir au menu...${NC}"
+                read -r
+                ;;
+            3)
                 collect_info
                 print_header
                 detect_os
                 check_resources
                 install_dependencies
                 setup_database
-                setup_ssl
+                if [ "$USE_SSL" = true ]; then
+                    setup_ssl
+                fi
                 install_panel
                 setup_webserver
                 install_vyrohost_theme
@@ -1449,16 +1846,13 @@ main_menu() {
                 echo -ne "\n  ${DIM}Appuyez sur Entrée pour revenir au menu...${NC}"
                 read -r
                 ;;
-            3)
-                print_header
-                detect_os
-                install_wings
-                echo -ne "\n  ${DIM}Appuyez sur Entrée pour revenir au menu...${NC}"
-                read -r
-                ;;
             4)
                 if [ -z "$FQDN" ]; then
-                    input_prompt "Nom de domaine (FQDN)" "" "FQDN"
+                    local SERVER_IP=$(curl -s4 https://ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+                    input_prompt "Domaine ou IP" "${SERVER_IP}" "FQDN"
+                    if [[ "$FQDN" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                        USE_SSL=false
+                    fi
                 fi
                 if [ -z "$WEBSERVER" ]; then
                     echo -e "  ${DIM}  [1]${NC} Nginx  ${DIM}  [2]${NC} Apache"
@@ -1516,7 +1910,7 @@ main_menu() {
                 ;;
             0)
                 echo ""
-                echo -e "  ${PURPLE}${BOLD}Au revoir ! 💜${NC}"
+                echo -e "  ${BLUE}${BOLD}Au revoir ! 💙${NC}"
                 echo -e "  ${DIM}VyroHost Staff Tool${NC}"
                 echo ""
                 exit 0
