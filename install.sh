@@ -483,11 +483,14 @@ setup_database() {
     systemctl start mariadb
     systemctl enable mariadb >> "$LOG_FILE" 2>&1
 
-    MYSQL_ROOT_PASSWORD=$(random_password)
     DB_PASSWORD=$(random_password)
 
-    # Sécurisation de MariaDB
-    mysql -u root <<EOF
+    # Tester si on peut se connecter sans mot de passe
+    local EXISTING_ROOT_PASS=""
+    if mysql -u root -e "SELECT 1;" &>/dev/null; then
+        # Pas de mot de passe root — première installation
+        MYSQL_ROOT_PASSWORD=$(random_password)
+        mysql -u root <<EOF
 ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
 DELETE FROM mysql.user WHERE User='';
 DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
@@ -495,11 +498,46 @@ DROP DATABASE IF EXISTS test;
 DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
 FLUSH PRIVILEGES;
 EOF
+    else
+        # MariaDB a déjà un mot de passe root (réinstallation)
+        print_warning "MariaDB a déjà un mot de passe root configuré"
+
+        # Essayer de le récupérer depuis les credentials existants
+        if [ -f /root/.vyrohost-credentials ]; then
+            EXISTING_ROOT_PASS=$(grep "MySQL Root" /root/.vyrohost-credentials 2>/dev/null | awk '{print $NF}')
+        fi
+
+        if [ -n "$EXISTING_ROOT_PASS" ] && mysql -u root -p"${EXISTING_ROOT_PASS}" -e "SELECT 1;" &>/dev/null; then
+            MYSQL_ROOT_PASSWORD="$EXISTING_ROOT_PASS"
+            print_info "Mot de passe root récupéré depuis les credentials existants"
+        else
+            # Demander le mot de passe à l'utilisateur
+            print_info "Entrez le mot de passe root MariaDB actuel"
+            password_prompt "Mot de passe root MariaDB" "EXISTING_ROOT_PASS"
+            if mysql -u root -p"${EXISTING_ROOT_PASS}" -e "SELECT 1;" &>/dev/null; then
+                MYSQL_ROOT_PASSWORD="$EXISTING_ROOT_PASS"
+                print_success "Connexion MariaDB réussie"
+            else
+                print_error "Mot de passe incorrect. Impossible de configurer la base de données."
+                print_info "Réinitialisez MariaDB: systemctl stop mariadb && mysqld_safe --skip-grant-tables &"
+                exit 1
+            fi
+        fi
+
+        # Nettoyage des anciennes entrées
+        mysql -u root -p"${MYSQL_ROOT_PASSWORD}" <<EOF
+DELETE FROM mysql.user WHERE User='';
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+FLUSH PRIVILEGES;
+EOF
+    fi
 
     # Création de la base et de l'utilisateur
     mysql -u root -p"${MYSQL_ROOT_PASSWORD}" <<EOF
+DROP USER IF EXISTS 'pterodactyl'@'127.0.0.1';
 CREATE DATABASE IF NOT EXISTS panel;
-CREATE USER IF NOT EXISTS 'pterodactyl'@'127.0.0.1' IDENTIFIED BY '${DB_PASSWORD}';
+CREATE USER 'pterodactyl'@'127.0.0.1' IDENTIFIED BY '${DB_PASSWORD}';
 GRANT ALL PRIVILEGES ON panel.* TO 'pterodactyl'@'127.0.0.1' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
 EOF
