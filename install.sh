@@ -1138,8 +1138,10 @@ uninstall_pterodactyl() {
 
     print_step "Désinstallation en cours..."
 
+    # Désactiver set -e pour la désinstallation (certains services peuvent ne pas exister)
+    set +e
+
     # Arrêt des services
-    echo -ne "\r  ${PURPLE}⠋${NC} Arrêt des services..."
     systemctl stop wings 2>/dev/null
     systemctl disable wings 2>/dev/null
     systemctl stop pteroq 2>/dev/null
@@ -1184,7 +1186,7 @@ uninstall_pterodactyl() {
     print_success "Configurations serveur web supprimées"
 
     # Nettoyage des crontabs
-    crontab -l 2>/dev/null | grep -v "pterodactyl\|vyrohost-backup\|certbot" | crontab -
+    (crontab -l 2>/dev/null | grep -v "pterodactyl\|vyrohost-backup\|certbot" | crontab -) 2>/dev/null
     print_success "Crontabs nettoyés"
 
     # Suppression du script de backup
@@ -1195,7 +1197,10 @@ uninstall_pterodactyl() {
     rm -f /root/.vyrohost-credentials
     print_success "Fichier credentials supprimé"
 
-    systemctl daemon-reload
+    systemctl daemon-reload 2>/dev/null
+
+    # Réactiver set -e
+    set -e
 
     echo ""
     print_separator
