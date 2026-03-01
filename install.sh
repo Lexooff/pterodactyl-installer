@@ -487,7 +487,10 @@ setup_database() {
 
     # Tester si on peut se connecter sans mot de passe
     local EXISTING_ROOT_PASS=""
-    if mysql -u root -e "SELECT 1;" &>/dev/null; then
+    local CAN_CONNECT_NO_PASS=false
+    mysql -u root -e "SELECT 1;" &>/dev/null && CAN_CONNECT_NO_PASS=true || true
+
+    if [ "$CAN_CONNECT_NO_PASS" = true ]; then
         # Pas de mot de passe root — première installation
         MYSQL_ROOT_PASSWORD=$(random_password)
         mysql -u root <<EOF
@@ -507,14 +510,21 @@ EOF
             EXISTING_ROOT_PASS=$(grep "MySQL Root" /root/.vyrohost-credentials 2>/dev/null | awk '{print $NF}')
         fi
 
-        if [ -n "$EXISTING_ROOT_PASS" ] && mysql -u root -p"${EXISTING_ROOT_PASS}" -e "SELECT 1;" &>/dev/null; then
+        local CREDS_PASS_OK=false
+        if [ -n "$EXISTING_ROOT_PASS" ]; then
+            mysql -u root -p"${EXISTING_ROOT_PASS}" -e "SELECT 1;" &>/dev/null && CREDS_PASS_OK=true || true
+        fi
+
+        if [ "$CREDS_PASS_OK" = true ]; then
             MYSQL_ROOT_PASSWORD="$EXISTING_ROOT_PASS"
             print_info "Mot de passe root récupéré depuis les credentials existants"
         else
             # Demander le mot de passe à l'utilisateur
             print_info "Entrez le mot de passe root MariaDB actuel"
             password_prompt "Mot de passe root MariaDB" "EXISTING_ROOT_PASS"
-            if mysql -u root -p"${EXISTING_ROOT_PASS}" -e "SELECT 1;" &>/dev/null; then
+            local MANUAL_PASS_OK=false
+            mysql -u root -p"${EXISTING_ROOT_PASS}" -e "SELECT 1;" &>/dev/null && MANUAL_PASS_OK=true || true
+            if [ "$MANUAL_PASS_OK" = true ]; then
                 MYSQL_ROOT_PASSWORD="$EXISTING_ROOT_PASS"
                 print_success "Connexion MariaDB réussie"
             else
