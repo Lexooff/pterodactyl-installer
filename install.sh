@@ -1214,14 +1214,16 @@ install_phpmyadmin() {
 
     # Ajouter PHPMyAdmin comme sous-dossier /phpmyadmin dans la config du Panel
     if [ "$WEBSERVER" = "nginx" ]; then
-        # Injecter le bloc location /phpmyadmin dans la config Nginx du panel
-        # On l'insère juste avant la dernière accolade fermante }
         local NGINX_CONF="/etc/nginx/sites-available/pterodactyl.conf"
         if [ -f "$NGINX_CONF" ]; then
-            # Créer le bloc à insérer
-            local PMA_BLOCK="
+            # Supprimer tout ancien bloc PHPMyAdmin existant
+            sed -i '/# PHPMyAdmin/,/# End PHPMyAdmin/d' "$NGINX_CONF"
+
+            # Écrire le bloc PHPMyAdmin dans un fichier temporaire
+            cat > /tmp/pma_location.conf <<PMAEOF
+
     # PHPMyAdmin
-    location /phpmyadmin {
+    location ^~ /phpmyadmin {
         alias ${PMA_DIR};
         index index.php;
 
@@ -1233,15 +1235,26 @@ install_phpmyadmin() {
             fastcgi_param SCRIPT_FILENAME ${PMA_DIR}/\$1;
         }
     }
-"
-            # Insérer avant le dernier } du fichier
-            sed -i "\$i\\${PMA_BLOCK}" "$NGINX_CONF"
-            
+    # End PHPMyAdmin
+PMAEOF
+
+            # Insérer avant la dernière } du fichier (méthode fiable)
+            head -n -1 "$NGINX_CONF" > "${NGINX_CONF}.tmp"
+            cat /tmp/pma_location.conf >> "${NGINX_CONF}.tmp"
+            echo "}" >> "${NGINX_CONF}.tmp"
+            mv "${NGINX_CONF}.tmp" "$NGINX_CONF"
+            rm -f /tmp/pma_location.conf
+
             # Supprimer l'ancienne config PMA séparée si elle existe
             rm -f /etc/nginx/sites-available/phpmyadmin.conf 2>/dev/null
             rm -f /etc/nginx/sites-enabled/phpmyadmin.conf 2>/dev/null
-            
-            systemctl restart nginx
+
+            # Tester la config Nginx avant de redémarrer
+            if nginx -t >> "$LOG_FILE" 2>&1; then
+                systemctl restart nginx
+            else
+                print_warning "Erreur dans la config Nginx - vérifiez: nginx -t"
+            fi
         fi
     else
         # Apache : alias /phpmyadmin
