@@ -882,6 +882,9 @@ install_wings() {
     # ── Configuration automatique du Node via l'API ──
     print_step "Configuration automatique du Node..."
 
+    # Désactiver set -e pour toute la section API (les appels peuvent échouer)
+    set +e
+
     # Récupérer la clé API depuis le panel
     local API_KEY=""
     if [ -f "${INSTALL_DIR}/.env" ]; then
@@ -911,6 +914,7 @@ install_wings() {
     if [ -z "$API_KEY" ]; then
         print_warning "Impossible de créer la clé API automatiquement"
         print_info "Configurez le Node manuellement depuis le Panel"
+        set -e
         return
     fi
 
@@ -940,6 +944,7 @@ install_wings() {
     if [ -z "$LOCATION_ID" ]; then
         print_warning "Impossible de créer la Location"
         print_info "Configurez le Node manuellement depuis le Panel"
+        set -e
         return
     fi
     print_success "Location créée (ID: ${LOCATION_ID})"
@@ -977,6 +982,7 @@ install_wings() {
     if [ -z "$NODE_ID" ]; then
         print_warning "Impossible de créer le Node"
         print_info "Configurez le Node manuellement depuis le Panel"
+        set -e
         return
     fi
     print_success "Node créé (ID: ${NODE_ID}) — RAM: ${ALLOC_MEM}MB, Disque: ${TOTAL_DISK}MB"
@@ -1026,6 +1032,7 @@ install_wings() {
     else
         print_warning "Impossible de récupérer la config Wings automatiquement"
         print_info "Récupérez-la depuis: Panel → Admin → Nodes → Configuration"
+        set -e
         return
     fi
 
@@ -1047,6 +1054,9 @@ install_wings() {
     echo -e "  ${DIM}├─${NC} Ports alloués: ${WHITE}Minecraft, FiveM, Rust, VALVE, TS3, Palworld...${NC}"
     echo -e "  ${DIM}├─${NC} Daemon:        ${WHITE}port 8080${NC}"
     echo -e "  ${DIM}└─${NC} SFTP:          ${WHITE}port 2022${NC}"
+
+    # Réactiver set -e
+    set -e
 }
 
 # ============================================================================
