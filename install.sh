@@ -482,33 +482,61 @@ setup_database() {
     if ! systemctl start mariadb &>/dev/null; then
         print_warning "MariaDB n'a pas pu démarrer, tentative de réparation..."
         
-        # Arrêter proprement tout processus MariaDB
+        # Arrêter proprement tout processus MariaDB/MySQL
         systemctl stop mariadb &>/dev/null
         pkill -9 mysqld &>/dev/null || true
         pkill -9 mariadbd &>/dev/null || true
         sleep 2
+
+        # Créer le dossier run s'il n'existe pas
+        mkdir -p /var/run/mysqld
+        chown mysql:mysql /var/run/mysqld
+        chmod 755 /var/run/mysqld
 
         # Nettoyer les fichiers de verrouillage et logs corrompus
         rm -f /var/lib/mysql/aria_log_control &>/dev/null
         rm -f /var/lib/mysql/ib_logfile* &>/dev/null
         rm -f /var/lib/mysql/*.pid &>/dev/null
         rm -f /var/run/mysqld/mysqld.sock &>/dev/null
+        rm -f /var/lib/mysql/tc.log &>/dev/null
+        rm -f /var/lib/mysql/multi-master.info &>/dev/null
 
         if ! systemctl start mariadb &>/dev/null; then
             print_warning "Réinitialisation complète de MariaDB..."
             systemctl stop mariadb &>/dev/null
             
-            # Purger et réinstaller MariaDB
+            # Purger complètement MariaDB
             (
-                apt-get purge -y mariadb-server mariadb-client mariadb-common >> "$LOG_FILE" 2>&1
-                rm -rf /var/lib/mysql /etc/mysql 2>/dev/null
-                apt-get install -y mariadb-server >> "$LOG_FILE" 2>&1
+                DEBIAN_FRONTEND=noninteractive apt-get purge -y mariadb-server mariadb-client mariadb-common mysql-common >> "$LOG_FILE" 2>&1
+                apt-get autoremove -y >> "$LOG_FILE" 2>&1
+                rm -rf /var/lib/mysql /etc/mysql /var/run/mysqld /var/log/mysql 2>/dev/null
+                # Réinstaller proprement
+                DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-server >> "$LOG_FILE" 2>&1
             ) &
             spinner $! "Réinstallation de MariaDB (cela peut prendre un moment)..."
             
+            # Préparer les dossiers après réinstallation
+            mkdir -p /var/run/mysqld
+            chown mysql:mysql /var/run/mysqld
+            chmod 755 /var/run/mysqld
+            mkdir -p /var/lib/mysql
+            chown mysql:mysql /var/lib/mysql
+            
+            # Initialiser la base de données si vide
+            if [ ! -f /var/lib/mysql/ibdata1 ]; then
+                print_info "Initialisation de la base de données..."
+                mariadb-install-db --user=mysql --datadir=/var/lib/mysql >> "$LOG_FILE" 2>&1 || \
+                mysql_install_db --user=mysql --datadir=/var/lib/mysql >> "$LOG_FILE" 2>&1 || true
+            fi
+            
             if ! systemctl start mariadb &>/dev/null; then
-                print_error "Impossible de démarrer MariaDB même après réinstallation"
-                print_info "Vérifiez les logs: journalctl -xeu mariadb.service"
+                # Dernier recours : démarrer manuellement pour voir l'erreur
+                print_error "Impossible de démarrer MariaDB"
+                print_info "Erreur détaillée:"
+                journalctl -xeu mariadb.service --no-pager -n 10 2>/dev/null | while read -r line; do
+                    echo -e "  ${DIM}  ${line}${NC}"
+                done
+                print_info "Essayez manuellement: apt purge mariadb-* mysql-* -y && apt install mariadb-server -y"
                 return 1
             fi
             print_success "MariaDB réinstallé et démarré"
