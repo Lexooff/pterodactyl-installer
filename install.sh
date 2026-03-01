@@ -499,10 +499,12 @@ setup_database() {
             systemctl stop mariadb &>/dev/null
             
             # Purger et réinstaller MariaDB
-            apt-get purge -y mariadb-server mariadb-client mariadb-common &>/dev/null
-            rm -rf /var/lib/mysql &>/dev/null
-            rm -rf /etc/mysql &>/dev/null
-            apt-get install -y mariadb-server >> "$LOG_FILE" 2>&1
+            (
+                apt-get purge -y mariadb-server mariadb-client mariadb-common >> "$LOG_FILE" 2>&1
+                rm -rf /var/lib/mysql /etc/mysql 2>/dev/null
+                apt-get install -y mariadb-server >> "$LOG_FILE" 2>&1
+            ) &
+            spinner $! "Réinstallation de MariaDB (cela peut prendre un moment)..."
             
             if ! systemctl start mariadb &>/dev/null; then
                 print_error "Impossible de démarrer MariaDB même après réinstallation"
