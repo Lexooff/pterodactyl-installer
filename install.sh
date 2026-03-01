@@ -785,7 +785,7 @@ install_phpmyadmin() {
     # Configuration
     local BLOWFISH_SECRET=$(openssl rand -base64 32)
     cp "$PMA_DIR/config.sample.inc.php" "$PMA_DIR/config.inc.php"
-    sed -i "s/\$cfg\['blowfish_secret'\] = ''/\$cfg['blowfish_secret'] = '${BLOWFISH_SECRET}'/" "$PMA_DIR/config.inc.php"
+    sed -i "s#\$cfg\['blowfish_secret'\] = ''#\$cfg['blowfish_secret'] = '${BLOWFISH_SECRET}'#" "$PMA_DIR/config.inc.php"
     
     mkdir -p "$PMA_DIR/tmp"
     chown -R www-data:www-data "$PMA_DIR" 2>/dev/null || chown -R nginx:nginx "$PMA_DIR" 2>/dev/null || chown -R apache:apache "$PMA_DIR" 2>/dev/null
