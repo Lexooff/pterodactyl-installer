@@ -1008,6 +1008,7 @@ PHPEOF
         # Réécrire le script avec le bon chemin (variable bash)
         cat > /tmp/vyro_create_apikey.php <<INNEREOF
 <?php
+require '${INSTALL_DIR}/vendor/autoload.php';
 \$app = require '${INSTALL_DIR}/bootstrap/app.php';
 \$kernel = \$app->make(Illuminate\Contracts\Console\Kernel::class);
 \$kernel->bootstrap();
