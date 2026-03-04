@@ -163,7 +163,8 @@ password_prompt() {
 }
 
 random_password() {
-    openssl rand -base64 32 | tr -dc 'a-zA-Z0-9!@#$%' | head -c 24
+    # Uniquement alphanumérique — évite les problèmes d'échappement SQL/shell
+    openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 32
 }
 
 # Retourne "https" ou "http" selon USE_SSL
@@ -739,6 +740,12 @@ install_panel() {
         --name-last="$ADMIN_LASTNAME" \
         --password="$ADMIN_PASSWORD" \
         --admin=1 >> "$LOG_FILE" 2>&1
+
+    # Forcer le hash du mot de passe via tinker (fix credentials mismatch)
+    php artisan tinker --execute="
+        \$u = \App\Models\User::where('email', '${ADMIN_EMAIL}')->first();
+        if (\$u) { \$u->password = bcrypt('${ADMIN_PASSWORD}'); \$u->save(); }
+    " >> "$LOG_FILE" 2>&1
 
     print_success "Utilisateur administrateur créé"
 
